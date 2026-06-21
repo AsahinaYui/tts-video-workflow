@@ -1,0 +1,228 @@
+{
+  "douyin": {
+    "display_name": "Douyin",
+    "url": "https://creator.douyin.com/",
+    "format": "vertical_short",
+    "expected_video": {
+      "aspect_ratio": "9:16",
+      "resolution": "1080x1920",
+      "preferred_fps": 25
+    },
+    "fields": {
+      "title": {
+        "required": true,
+        "max_chars": 55,
+        "guidance": "Use a short hook. Keep core emotion or conflict in the first half."
+      },
+      "description": {
+        "required": false,
+        "max_chars": 500,
+        "guidance": "Can mirror the title plus 2-5 hashtags."
+      },
+      "hashtags": {
+        "required": false,
+        "max_count": 8,
+        "style": "inline_hashtag"
+      },
+      "cover": {
+        "required": false,
+        "recommended": true,
+        "guidance": "Use a clear face or highest-emotion frame. Avoid covering faces with text."
+      }
+    }
+  },
+  "xiaohongshu": {
+    "display_name": "Xiaohongshu",
+    "url": "https://creator.xiaohongshu.com/",
+    "format": "vertical_short",
+    "expected_video": {
+      "aspect_ratio": "9:16",
+      "resolution": "1080x1920",
+      "preferred_fps": 25
+    },
+    "fields": {
+      "title": {
+        "required": true,
+        "max_chars": 20,
+        "guidance": "Short, diary-like, emotional title. Avoid stuffing too many keywords."
+      },
+      "description": {
+        "required": true,
+        "max_chars": 1000,
+        "guidance": "Use 1-3 lines of context, then topic tags."
+      },
+      "hashtags": {
+        "required": true,
+        "max_count": 10,
+        "style": "topic_tag"
+      },
+      "cover": {
+        "required": true,
+        "recommended": true,
+        "guidance": "Cover is important. Use a clean frame with the character face readable."
+      }
+    }
+  },
+  "bilibili": {
+    "display_name": "Bilibili",
+    "url": "https://member.bilibili.com/platform/upload/video/frame",
+    "format": "video",
+    "defaults": {
+      "title": "first_sentence",
+      "description_template": "文案：{copy_text}",
+      "publish_timing": "immediate",
+      "category": "情感",
+      "creative_declaration": "内容无需标注",
+      "tags": [
+        "情感",
+        "原创",
+        "人生",
+        "文艺",
+        "MyGo",
+        "Avemujica",
+        "睦子米",
+        "若叶睦"
+      ]
+    },
+    "expected_video": {
+      "aspect_ratio": "9:16",
+      "resolution": "1080x1920",
+      "preferred_fps": 25
+    },
+    "fields": {
+      "title": {
+        "required": true,
+        "max_chars": 80,
+        "guidance": "Readable complete title. Include series/character keyword when helpful."
+      },
+      "description": {
+        "required": false,
+        "max_chars": 2000,
+        "guidance": "Default format: 文案：<copy used in the audio/video workflow>."
+      },
+      "tags": {
+        "required": true,
+        "max_count": 10,
+        "style": "separate_tag"
+      },
+      "cover": {
+        "required": true,
+        "recommended": true,
+        "source": "original_image",
+        "review_required": true,
+        "upload_target": "个人空间封面",
+        "sync_dual_ratio": true,
+        "auto_home_recommend_cover": "4:3",
+        "candidates": [
+          {
+            "name": "cover_16x9.png",
+            "aspect_ratio": "16:9",
+            "resolution": "1920x1080"
+          }
+        ],
+        "guidance": "Crop the 16:9 cover from the original image supplied by the user, not from the edited/cropped video. During Bilibili upload, choose 个人空间封面, upload the approved 16:9 cover, tick 双比例同步改动, and let Bilibili auto-generate the 4:3 首页推荐封面 without further manual edits."
+      },
+      "category": {
+        "required": true,
+        "default": "情感",
+        "guidance": "Select 情感 unless the user explicitly chooses another category."
+      },
+      "creative_declaration": {
+        "required": true,
+        "default": "内容无需标注",
+        "guidance": "Select 内容无需标注."
+      }
+    }
+  },
+  "kuaishou": {
+    "display_name": "Kuaishou",
+    "url": "https://cp.kuaishou.com/",
+    "format": "vertical_short",
+    "expected_video": {
+      "aspect_ratio": "9:16",
+      "resolution": "1080x1920",
+      "preferred_fps": 25
+    },
+    "fields": {
+      "title": {
+        "required": false,
+        "max_chars": 50,
+        "guidance": "Short and direct."
+      },
+      "description": {
+        "required": false,
+        "max_chars": 500,
+        "guidance": "Use concise copy and a few hashtags."
+      },
+      "hashtags": {
+        "required": false,
+        "max_count": 8,
+        "style": "inline_hashtag"
+      },
+      "cover": {
+        "required": false,
+        "recommended": true,
+        "guidance": "Use a clear vertical frame."
+      }
+    }
+  },
+  "youtube_shorts": {
+    "display_name": "YouTube Shorts",
+    "url": "https://studio.youtube.com/",
+    "format": "vertical_short",
+    "expected_video": {
+      "aspect_ratio": "9:16",
+      "resolution": "1080x1920",
+      "preferred_fps": 25
+    },
+    "fields": {
+      "title": {
+        "required": true,
+        "max_chars": 100,
+        "guidance": "Include #Shorts only if useful for the channel convention."
+      },
+      "description": {
+        "required": false,
+        "max_chars": 5000,
+        "guidance": "Can include credits, context, and hashtags."
+      },
+      "tags": {
+        "required": false,
+        "max_count": 15,
+        "style": "separate_tag"
+      },
+      "cover": {
+        "required": false,
+        "recommended": false,
+        "guidance": "Shorts thumbnail controls may vary by account and device."
+      }
+    }
+  },
+  "tiktok": {
+    "display_name": "TikTok",
+    "url": "https://www.tiktok.com/upload",
+    "format": "vertical_short",
+    "expected_video": {
+      "aspect_ratio": "9:16",
+      "resolution": "1080x1920",
+      "preferred_fps": 25
+    },
+    "fields": {
+      "caption": {
+        "required": true,
+        "max_chars": 2200,
+        "guidance": "Use a short hook plus hashtags."
+      },
+      "hashtags": {
+        "required": false,
+        "max_count": 8,
+        "style": "inline_hashtag"
+      },
+      "cover": {
+        "required": false,
+        "recommended": true,
+        "guidance": "Choose the clearest frame in the upload UI."
+      }
+    }
+  }
+}

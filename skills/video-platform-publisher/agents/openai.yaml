@@ -1,0 +1,4 @@
+interface:
+  display_name: "Video Platform Publisher"
+  short_description: "Prepare platform drafts and assist safe video publishing."
+  default_prompt: "Use $video-platform-publisher to prepare my finished MP4 for platform upload, metadata, cover, and final publishing confirmation."

@@ -1,0 +1,5 @@
+interface:
+  display_name: "GPT-SoVITS TTS"
+  short_description: "Generate, repair, and verify GPT-SoVITS narration audio."
+  default_prompt: "Use $gptsovits-tts to generate a reviewed GPT-SoVITS narration WAV from my text."
+

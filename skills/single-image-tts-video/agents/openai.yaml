@@ -1,0 +1,4 @@
+interface:
+  display_name: "Single Image TTS Video"
+  short_description: "Preview a 9:16 crop, then create a subtitled narration MP4 with optional quiet BGM."
+  default_prompt: "Use $single-image-tts-video to preview my image crop, then turn it and GPT-SoVITS audio into a subtitled MP4. If I provide music, add it quietly as BGM while keeping narration clear."

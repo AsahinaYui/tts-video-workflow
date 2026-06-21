@@ -1,0 +1,42 @@
+{
+  "gptsovits_root": "E:/TTS/GPT-SoVITS-v2pro-20250604",
+  "python_exe": "E:/TTS/GPT-SoVITS-v2pro-20250604/runtime/python.exe",
+  "tts_config_path": "skills/gptsovits-tts/config/tts_infer_v2pro.yaml",
+  "gpt_weights_path": "E:/TTS/GPT-SoVITS-v2pro-20250604/GPT_weights_v2Pro/your_model.ckpt",
+  "sovits_weights_path": "E:/TTS/GPT-SoVITS-v2pro-20250604/SoVITS_weights_v2Pro/your_model.pth",
+  "model_storage": {
+    "gpt_weights_dir": "models/gpt_weights",
+    "sovits_weights_dir": "models/sovits_weights"
+  },
+  "api": {
+    "tts_url": "http://127.0.0.1:9880/tts",
+    "health_url": "http://127.0.0.1:9880/docs",
+    "startup_timeout_seconds": 300,
+    "request_timeout_seconds": 900
+  },
+  "model_switch": {
+    "default_version": "v2"
+  },
+  "voice": {
+    "ref_audio_path": "reference/your_reference.wav",
+    "ref_text_path": "reference/your_reference.txt",
+    "ref_text_encoding": "utf-8-sig",
+    "prompt_lang": "zh",
+    "text_lang": "zh"
+  },
+  "sampling": {
+    "top_k": 25,
+    "top_p": 1.0,
+    "temperature": 0.9
+  },
+  "output": {
+    "dir": "outputs/tts",
+    "format": "wav",
+    "open_after_generate": false
+  },
+  "extra_request_params": {
+    "text_split_method": "cut1",
+    "fragment_interval": 0.35,
+    "speed_factor": 0.95
+  }
+}

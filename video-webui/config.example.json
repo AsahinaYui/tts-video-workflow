@@ -1,0 +1,63 @@
+{
+  "project_root": "E:/TTS/mutsumi-tts-video-workflow",
+  "python_exe": "E:/TTS/GPT-SoVITS-v2pro-20250604/runtime/python.exe",
+  "gptsovits_root": "E:/TTS/GPT-SoVITS-v2pro-20250604",
+  "gpt_weights_dirs": [
+    "E:/TTS/GPT-SoVITS-v2pro-20250604/GPT_weights",
+    "E:/TTS/GPT-SoVITS-v2pro-20250604/GPT_weights_v2",
+    "E:/TTS/GPT-SoVITS-v2pro-20250604/GPT_weights_v2Pro",
+    "E:/TTS/GPT-SoVITS-v2pro-20250604/GPT_weights_v2ProPlus",
+    "E:/TTS/GPT-SoVITS-v2pro-20250604/GPT_weights_v3",
+    "E:/TTS/GPT-SoVITS-v2pro-20250604/GPT_weights_v4"
+  ],
+  "sovits_weights_dirs": [
+    "E:/TTS/GPT-SoVITS-v2pro-20250604/SoVITS_weights",
+    "E:/TTS/GPT-SoVITS-v2pro-20250604/SoVITS_weights_v2",
+    "E:/TTS/GPT-SoVITS-v2pro-20250604/SoVITS_weights_v2Pro",
+    "E:/TTS/GPT-SoVITS-v2pro-20250604/SoVITS_weights_v2ProPlus",
+    "E:/TTS/GPT-SoVITS-v2pro-20250604/SoVITS_weights_v3",
+    "E:/TTS/GPT-SoVITS-v2pro-20250604/SoVITS_weights_v4"
+  ],
+  "gsv_tts_script": "E:/TTS/mutsumi-tts-video-workflow/skills/gptsovits-tts/scripts/gsv_tts.py",
+  "tts_checker_script": "E:/TTS/mutsumi-tts-video-workflow/skills/gptsovits-tts/scripts/check_tts_match.py",
+  "video_script": "E:/TTS/mutsumi-tts-video-workflow/skills/single-image-tts-video/scripts/make_single_image_video.py",
+  "ffmpeg": "E:/TTS/GPT-SoVITS-v2pro-20250604/runtime/ffmpeg.exe",
+  "ffprobe": "E:/TTS/GPT-SoVITS-v2pro-20250604/runtime/ffprobe.exe",
+  "asr_model": "E:/TTS/faster-whisper-small",
+  "jobs_dir": "jobs",
+  "host": "127.0.0.1",
+  "port": 7860,
+  "checker_timeout_seconds": 900,
+  "max_auto_patch_chunks": 8,
+  "script_subtitle_max_chars": 70,
+  "script_subtitle_line_chars": 34,
+  "script_subtitle_max_lines": 2,
+  "render_audio_head_pad_ms": 200,
+  "agent_review": {
+    "mode": "local",
+    "api_url": "",
+    "model": "",
+    "api_key_env": "AGENT_REVIEW_API_KEY",
+    "timeout": 120
+  },
+  "reference_assets": [],
+  "models": [
+    {
+      "id": "base_model",
+      "name": "底模推理",
+      "base_config": "E:/TTS/mutsumi-tts-video-workflow/skills/gptsovits-tts/config/voice_default.json",
+      "default_version": "v2",
+      "gpt_weights_path": "__use_pretrained_base__",
+      "sovits_weights_path": "__use_pretrained_base__",
+      "use_pretrained_base": true,
+      "prompt_lang": "zh",
+      "text_lang": "zh",
+      "speed_factor": 0.95,
+      "fragment_interval": 0.35,
+      "text_split_method": "cut1",
+      "top_k": 25,
+      "top_p": 1.0,
+      "temperature": 0.9
+    }
+  ]
+}

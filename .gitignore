@@ -1,0 +1,56 @@
+# Local config
+config.json
+video-webui/config.json
+local/
+.env
+.env.*
+
+# Generated jobs, caches, and temporary files
+jobs/
+video-webui/jobs/
+video-webui/temp/
+video-webui/tmp/
+temp/
+tmp/
+work/
+outputs/
+logs/
+__pycache__/
+*.py[cod]
+
+# Local/private reference material
+reference/
+video-webui/presets/reference_assets/
+
+# External model/runtime folders should not be committed
+GPT-SoVITS*/
+faster-whisper*/
+models/
+*.ckpt
+*.pth
+*.bin
+*.safetensors
+
+# Generated media and editor outputs
+*.wav
+*.mp3
+*.flac
+*.ogg
+*.aac
+*.m4a
+*.mp4
+*.mov
+*.mkv
+*.avi
+*.srt
+*.ass
+*.prproj
+
+# Runtime logs and Windows metadata
+*.log
+server_boot.log
+server_stdout.txt
+server_stderr.txt
+*.lnk
+Thumbs.db
+Desktop.ini

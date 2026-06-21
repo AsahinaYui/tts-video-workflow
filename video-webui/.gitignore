@@ -1,0 +1,41 @@
+# Local config and machine-specific paths
+config.json
+.env
+.env.*
+
+# Generated jobs, caches, and temporary files
+jobs/
+temp/
+tmp/
+__pycache__/
+*.py[cod]
+
+# Runtime logs
+logs/
+server_boot.log
+server_stdout.txt
+server_stderr.txt
+*.log
+
+# User/private presets and source assets
+presets/reference_assets/
+
+# Generated media and editing project outputs
+*.wav
+*.mp3
+*.flac
+*.ogg
+*.aac
+*.m4a
+*.mp4
+*.mov
+*.mkv
+*.avi
+*.srt
+*.ass
+*.prproj
+
+# Local Windows shortcuts and metadata
+*.lnk
+Thumbs.db
+Desktop.ini

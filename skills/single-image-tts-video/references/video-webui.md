@@ -1,0 +1,184 @@
+# Local Video WebUI Reference
+
+Read this when working on, migrating, or reasoning about the local WebUI created after the original `single-image-tts-video` skill.
+
+## Project Location
+
+Current WebUI root:
+
+```text
+E:\TTS\video-webui
+```
+
+Important files:
+
+- `app.py`
+- `config.json`
+- `config.example.json`
+- `PROJECT_MEMORY.md`
+- `README.md`
+- `start_webui.ps1`
+- `stop_webui.ps1`
+- `run.ps1`
+- `jobs/`
+
+The WebUI is not the same thing as this skill folder. It is a Gradio application that orchestrates this skill plus GPT-SoVITS and Faster-Whisper.
+
+Before moving or modifying it, read:
+
+```text
+E:\TTS\video-webui\PROJECT_MEMORY.md
+```
+
+## Current Dependencies
+
+The WebUI calls scripts and assets from `E:\TTS\Mutsumi`, including:
+
+- `skills/gptsovits-tts/scripts/gsv_tts.py`
+- `skills/gptsovits-tts/scripts/check_tts_match.py`
+- `skills/single-image-tts-video/scripts/make_single_image_video.py`
+- `reference/mutsumi_ref_9p5s.wav`
+- `reference/mutsumi_ref_9p5s.txt`
+
+It also depends on:
+
+- GPT-SoVITS runtime Python: `E:/TTS/GPT-SoVITS-v2pro-20250604/runtime/python.exe`
+- ffmpeg/ffprobe in the same runtime
+- Faster-Whisper model: `E:/TTS/faster-whisper-small`
+- GPT/SoVITS weight directories under `E:/TTS/GPT-SoVITS-v2pro-20250604`
+
+## Launch
+
+Start:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File "E:\TTS\video-webui\start_webui.ps1"
+```
+
+Open:
+
+```text
+http://127.0.0.1:7860
+```
+
+Stop:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File "E:\TTS\video-webui\stop_webui.ps1"
+```
+
+## WebUI Features
+
+- Upload source image, narration script, optional narration audio, optional BGM, optional SRT.
+- Select role preset from `config.json`.
+- Select GPT weights and SoVITS weights in the UI.
+- Select reference audio/text preset, upload reference audio override, edit reference text.
+- Select prompt language and generated audio language.
+- Tune speed, fragment interval, `top_k`, `top_p`, and `temperature`.
+- Generate normal GPT-SoVITS TTS.
+- Generate segmented TTS auto-repair audio.
+- Generate crop preview and final single-image video.
+- Generate Faster-Whisper subtitles.
+- Edit SRT manually in the UI.
+- Retiming from the SRT editor is supported.
+- Local second review compares script, raw ASR, and final subtitles.
+- Optional Chat-compatible API review is present, but default `agent_review.mode` is `local`.
+- Automatic missing-sentence repair is present.
+- Manual patch target selection is present.
+- Single-sentence patch preview/apply is present in the SRT review area.
+
+## Recommended Main WebUI Workflow
+
+For long scripts:
+
+1. Prepare job.
+2. Run segmented TTS auto-repair.
+3. Run audio/subtitle review.
+4. Run automatic missing-sentence patch if needed.
+5. Use manual patch targets when needed.
+6. For fine tone fixes, generate a single-sentence preview and only apply it after human listening approves it.
+7. Render video.
+
+Faster-Whisper subtitle generation is a diagnostic/manual tool, not the main path when using segmented TTS -> review -> patch.
+
+## TTS Repair Behavior
+
+Segmented repair:
+
+- Splits long text into smaller chunks.
+- Generates each chunk independently with GPT-SoVITS.
+- Checks each generated chunk using Faster-Whisper.
+- Retries failed chunks.
+- Gives early chunks extra attempts because GPT-SoVITS often clips beginnings.
+- If a full chunk still fails, falls back to 10-20 character micro chunks.
+- Rebuilds final narration from accepted segment audio files.
+
+Secondary patch:
+
+- Uses raw ASR if available to identify missing or weak chunks.
+- Does not append missing audio to the end.
+- Requires a complete segment audio map from segmented TTS.
+- For problematic chunks, splits into comma-level clauses, generates clauses, rebuilds the chunk, and replaces the original chunk position.
+
+Manual patch targets:
+
+- `3` means rebuild segment 3.
+- `3.2` means rebuild segment 3, focusing on comma-clause 2.
+- Multiple targets such as `1, 3.2, 5.1` are supported.
+- Chinese comma, English comma, spaces, semicolons, and dunhao are accepted separators.
+- `3.2`, `3-2`, `3_2`, and `3:2` are accepted target formats.
+
+Single-sentence patch:
+
+- Located under `SRT 校对与任务目录` -> `单句补漏 / 替换试听`.
+- `6a. 生成单句试听` generates only the target sentence with independent speed, fragment interval, `top_k`, `top_p`, and `temperature`.
+- `6b. 应用到当前音频` inserts the sentence when raw ASR indicates it is missing; otherwise it replaces/rebuilds the targeted sentence audio.
+- Replacement is not additive: it removes the original target segment from the current audio sequence and then inserts the approved regenerated audio at that same position.
+- If a target number is supplied with rewritten/retouched text, treat it as replacement even if the new text is absent from raw ASR.
+- The user may repeatedly run `6a` with different single-sentence parameters and only run `6b` after the preview sounds right.
+- Raw ASR is preferred for deciding missing vs replacement because final script-aligned subtitles may already contain text that the audio omitted.
+- A complete segment audio map from `2b. 分段 TTS 自动修复` is still required so replacement can preserve the original narration order.
+
+## Subtitle Rules
+
+- Final subtitles follow the source script, not ASR wording.
+- Raw ASR is kept for review.
+- Display subtitles should not include punctuation.
+- Punctuation remains useful internally for split boundaries.
+- TTS text should keep punctuation for natural GPT-SoVITS pauses.
+- Use 1-2 subtitle lines.
+- Avoid splitting words.
+- Prefer semantic line breaks and speech-pause boundaries.
+- In the SRT editor, one subtitle page corresponds to one time range.
+- A manual line break inside a page is treated as a final subtitle display line.
+- A blank line creates a new subtitle page when running `4b. 按编辑器重排时间轴`.
+- After `4b`, the editor is rewritten as SRT blocks whose text lines match final display wrapping.
+- Rendering uses the SRT editor pages and line breaks as the final subtitle pages and line breaks; do not rewrap them during final render.
+
+Key WebUI functions:
+
+- `strip_subtitle_punctuation`
+- `subtitle_blocks_from_script`
+- `wrap_cjk_subtitle_text`
+- `format_subtitle_block`
+- `script_aligned_srt_from_segments`
+
+## Render Head Padding
+
+The WebUI avoids clipped first syllables in final MP4 rendering:
+
+- Config key: `render_audio_head_pad_ms`
+- Default: `200`
+- During render, the app creates `job/tmp/render_narration_head_padded.wav`.
+- SRT timestamps are shifted by the same amount.
+- Original TTS audio is not modified.
+
+## Repository Notes
+
+The clean repository layout keeps the WebUI at:
+
+```text
+E:\TTS\mutsumi-tts-video-workflow\video-webui
+```
+
+The active `config.json` should point to local `E:\TTS` paths for GPT-SoVITS, Faster-Whisper, reference assets, and generated job output.
