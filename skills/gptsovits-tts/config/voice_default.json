@@ -1,9 +1,9 @@
 {
-  "gptsovits_root": "E:/TTS/GPT-SoVITS-v2pro-20250604",
-  "python_exe": "E:/TTS/GPT-SoVITS-v2pro-20250604/runtime/python.exe",
+  "gptsovits_root": "__GPTSOVITS_ROOT__",
+  "python_exe": "__GPTSOVITS_ROOT__/runtime/python.exe",
   "tts_config_path": "skills/gptsovits-tts/config/tts_infer_v2pro.yaml",
-  "gpt_weights_path": "E:/TTS/GPT-SoVITS-v2pro-20250604/GPT_weights_v2Pro/your_model.ckpt",
-  "sovits_weights_path": "E:/TTS/GPT-SoVITS-v2pro-20250604/SoVITS_weights_v2Pro/your_model.pth",
+  "gpt_weights_path": "__GPTSOVITS_ROOT__/GPT_weights_v2Pro/your_model.ckpt",
+  "sovits_weights_path": "__GPTSOVITS_ROOT__/SoVITS_weights_v2Pro/your_model.pth",
   "model_storage": {
     "gpt_weights_dir": "models/gpt_weights",
     "sovits_weights_dir": "models/sovits_weights"

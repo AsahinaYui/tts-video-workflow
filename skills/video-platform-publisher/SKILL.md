@@ -89,7 +89,7 @@ python .\skills\video-platform-publisher\scripts\prepare_publish_package.py `
   --video .\outputs\video\mutsumi_single_image_20260610_crop9x16\preview.mp4 `
   --platform bilibili `
   --text-file .\work\tts-input-20260610.txt `
-  --original-image "E:\path\to\original-image.png"
+  --original-image "<path-to-original-image>"
 ```
 
 The Bilibili package includes:
@@ -107,7 +107,7 @@ python .\skills\video-platform-publisher\scripts\prepare_publish_package.py `
   --video .\outputs\video\mutsumi_single_image_20260610_crop9x16\preview.mp4 `
   --platform bilibili `
   --text-file .\work\tts-input-20260610.txt `
-  --original-image "E:\path\to\original-image.png" `
+  --original-image "<path-to-original-image>" `
   --scheduled-time "2026-06-10 20:30"
 ```
 

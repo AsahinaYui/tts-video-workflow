@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -25,7 +26,7 @@ SKILL_ROOT = SCRIPT_PATH.parents[1]
 PROJECT_ROOT = SKILL_ROOT.parent.parent if SKILL_ROOT.parent.name == "skills" else Path.cwd()
 DEFAULT_PROFILES = SKILL_ROOT / "references" / "platform_profiles.json"
 DEFAULT_GPTSOVITS_ROOT = Path(
-    "E:/TTS/GPT-SoVITS-v2pro-20250604"
+    os.environ.get("GPTSOVITS_ROOT", str(PROJECT_ROOT.parent / "GPT-SoVITS-v2pro-20250604"))
 )
 
 

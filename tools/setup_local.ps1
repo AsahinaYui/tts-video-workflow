@@ -61,8 +61,17 @@ if (-not (Test-Path -LiteralPath $VoiceTemplate)) {
     throw "Missing voice template: $VoiceTemplate"
 }
 
-$DefaultGptSoVitsRoot = "E:\TTS\GPT-SoVITS-v2pro-20250604"
-$DefaultAsrModel = "E:\TTS\faster-whisper-small"
+$RepoParent = Split-Path -Parent $RepoRoot
+$DefaultGptSoVitsRoot = if ($env:GPTSOVITS_ROOT) {
+    $env:GPTSOVITS_ROOT
+} else {
+    Join-Path $RepoParent "GPT-SoVITS-v2pro-20250604"
+}
+$DefaultAsrModel = if ($env:FASTER_WHISPER_MODEL) {
+    $env:FASTER_WHISPER_MODEL
+} else {
+    Join-Path $RepoParent "faster-whisper-small"
+}
 
 if ([string]::IsNullOrWhiteSpace($GptSoVitsRoot)) {
     $GptSoVitsRoot = Read-SetupValue "GPT-SoVITS root" $DefaultGptSoVitsRoot

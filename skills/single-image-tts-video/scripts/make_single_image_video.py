@@ -27,9 +27,11 @@ SCRIPT_PATH = Path(__file__).resolve()
 SKILL_ROOT = SCRIPT_PATH.parents[1]
 PROJECT_ROOT = SKILL_ROOT.parent.parent if SKILL_ROOT.parent.name == "skills" else Path.cwd()
 DEFAULT_GPTSOVITS_ROOT = Path(
-    "E:/TTS/GPT-SoVITS-v2pro-20250604"
+    os.environ.get("GPTSOVITS_ROOT", str(PROJECT_ROOT.parent / "GPT-SoVITS-v2pro-20250604"))
 )
-DEFAULT_ASR_MODEL = Path("E:/TTS/faster-whisper-small")
+DEFAULT_ASR_MODEL = Path(
+    os.environ.get("FASTER_WHISPER_MODEL", str(PROJECT_ROOT.parent / "faster-whisper-small"))
+)
 
 
 class VideoWorkflowError(RuntimeError):

@@ -9,13 +9,13 @@ Use this skill to produce the final reviewed narration WAV for the Mutsumi workf
 
 ## Current Defaults
 
-- Project root: `E:/TTS/Mutsumi`
-- GPT-SoVITS root: `E:/TTS/GPT-SoVITS-v2pro-20250604`
-- Runtime Python: `E:/TTS/GPT-SoVITS-v2pro-20250604/runtime/python.exe`
+- Project root: the repository root that contains `skills/`.
+- GPT-SoVITS root: set in `video-webui/config.json`, `voice_default.json`, or `GPTSOVITS_ROOT`.
+- Runtime Python: `<GPT-SoVITS-root>/runtime/python.exe`.
 - Voice config: `skills/gptsovits-tts/config/voice_default.json`
-- Reference audio: `reference/mutsumi_ref_9p5s.wav`
-- Reference text: `reference/mutsumi_ref_9p5s.txt`
-- ASR model: `E:/TTS/faster-whisper-small`
+- Reference audio: configured locally in `config.json`.
+- Reference text: configured locally in `config.json`.
+- ASR model: set in `video-webui/config.json` or `FASTER_WHISPER_MODEL`.
 - Final audio directory: `outputs/tts_final`
 
 The voice config should keep these request parameters unless the user asks to change them:
@@ -66,11 +66,11 @@ python .\skills\gptsovits-tts\scripts\gsv_tts.py --text "可能是我太主动" 
 Check a WAV against the intended text:
 
 ```powershell
-& "E:\TTS\GPT-SoVITS-v2pro-20250604\runtime\python.exe" `
+& "<GPT-SoVITS-root>\runtime\python.exe" `
   .\skills\gptsovits-tts\scripts\check_tts_match.py `
   --audio .\outputs\tts_final\final.wav `
   --text-file .\work\tts-input-20260610.txt `
-  --model "E:\TTS\faster-whisper-small"
+  --model "<Faster-Whisper-model-dir>"
 ```
 
 Check the newest WAV in `outputs/tts_final`:

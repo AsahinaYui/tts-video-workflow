@@ -2,7 +2,7 @@
 
 本地单图口播视频流水线，目标是把之前靠 Codex Agent 串起来的流程固化成可重复运行的本地 WebUI。
 
-如果要迁移、交接给其他线程/Agent，先读 `PROJECT_MEMORY.md`。那里记录了后续补漏、字幕、渲染修复和 E 盘迁移清单。
+如果要迁移或交接，先读仓库根目录 `README.md`，并确认本机 `config.json` 已经指向正确的 GPT-SoVITS、Faster-Whisper 和 FFmpeg 路径。
 
 ## 功能
 
@@ -21,21 +21,21 @@
 后台启动：
 
 ```powershell
-cd E:\TTS\mutsumi-tts-video-workflow\video-webui
+cd <repo>\video-webui
 .\start_webui.ps1
 ```
 
 停止后台服务：
 
 ```powershell
-cd E:\TTS\mutsumi-tts-video-workflow\video-webui
+cd <repo>\video-webui
 .\stop_webui.ps1
 ```
 
 前台启动（方便实时看日志）：
 
 ```powershell
-cd E:\TTS\mutsumi-tts-video-workflow\video-webui
+cd <repo>\video-webui
 .\run.ps1
 ```
 
@@ -60,7 +60,7 @@ server_stderr.txt
 如果 GPT-SoVITS runtime 里没有 Gradio：
 
 ```powershell
-E:\TTS\GPT-SoVITS-v2pro-20250604\runtime\python.exe -m pip install -r requirements.txt
+<GPT-SoVITS-root>\runtime\python.exe -m pip install -r requirements.txt
 ```
 
 ## 模型配置

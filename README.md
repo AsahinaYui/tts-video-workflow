@@ -24,11 +24,11 @@
 
 ## 本地依赖
 
-需要自行准备：
+需要自行准备，并在本地配置中填写真实路径：
 
-- GPT-SoVITS v2/v2Pro 本地项目，例如 `E:/TTS/GPT-SoVITS-v2pro-20250604`
+- GPT-SoVITS v2/v2Pro 本地项目
 - GPT-SoVITS runtime Python、FFmpeg、FFprobe
-- Faster-Whisper 模型，例如 `E:/TTS/faster-whisper-small`
+- Faster-Whisper 模型
 - 参考音频和对应参考文本
 - 可选的自训练 GPT weights / SoVITS weights
 
@@ -37,7 +37,7 @@
 Windows 用户可以先运行：
 
 ```powershell
-cd E:\TTS\mutsumi-tts-video-workflow
+cd <repo>
 .\setup_windows.bat
 ```
 
@@ -56,7 +56,7 @@ cd E:\TTS\mutsumi-tts-video-workflow
 默认不会下载 GPT-SoVITS、模型或其他大文件。如果需要顺便安装 Python 包，可以运行：
 
 ```powershell
-cd E:\TTS\mutsumi-tts-video-workflow
+cd <repo>
 powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\setup_local.ps1 -InstallPythonPackages
 ```
 
@@ -67,7 +67,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\setup_local.ps1 -Ins
 如果不使用 `setup_windows.bat`，也可以手动复制示例配置：
 
 ```powershell
-cd E:\TTS\mutsumi-tts-video-workflow\video-webui
+cd <repo>\video-webui
 Copy-Item .\config.example.json .\config.json
 ```
 
@@ -76,7 +76,7 @@ Copy-Item .\config.example.json .\config.json
 启动前建议先检查本机依赖：
 
 ```powershell
-cd E:\TTS\mutsumi-tts-video-workflow
+cd <repo>
 python .\tools\check_environment.py
 ```
 
@@ -91,7 +91,7 @@ check_environment.bat
 启动 WebUI：
 
 ```powershell
-cd E:\TTS\mutsumi-tts-video-workflow\video-webui
+cd <repo>\video-webui
 .\start_webui.ps1
 ```
 

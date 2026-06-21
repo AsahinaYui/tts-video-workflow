@@ -7,7 +7,7 @@ description: Create a subtitled 9:16 MP4 video from one still image and a GPT-So
 
 Use this skill after the GPT-SoVITS narration WAV is final.
 
-If the user mentions the local WebUI, `video-webui`, migration to `E:\`, automatic missing-sentence repair, manual patch targets such as `3.2`, or the optimized subtitle workflow, read `references/video-webui.md` before acting. That reference records the newer WebUI project at `E:\TTS\video-webui`.
+If the user mentions the local WebUI, `video-webui`, automatic missing-sentence repair, manual patch targets such as `3.2`, or the optimized subtitle workflow, read `references/video-webui.md` before acting.
 
 ## Inputs
 
@@ -22,7 +22,7 @@ If the user mentions the local WebUI, `video-webui`, migration to `E:\`, automat
 2. Render a `1080x1920` crop preview first with `--crop-preview-only`. Send the preview image to the user and wait for confirmation.
 3. If the crop is poor, adjust `--crop-x` and `--crop-y` until the user approves. Use `0.0` for left/top, `0.5` for center, and `1.0` for right/bottom.
 4. Confirm the narration audio already passed the `gptsovits-tts` checker. If not, run that skill first.
-5. Generate an SRT from the narration audio with Faster-Whisper when no corrected SRT exists. Use the local model at `E:/TTS/faster-whisper-small`.
+5. Generate an SRT from the narration audio with Faster-Whisper when no corrected SRT exists. Use the local model configured in `config.json` or `FASTER_WHISPER_MODEL`.
 6. Review the SRT against the source text and audio:
    - Missing or repeated sentence stems must be corrected before export.
    - Accent-related ASR substitutions are acceptable only when the spoken audio is complete.
@@ -60,7 +60,7 @@ When the user sends a music file while making a video, use it as background musi
 ## Default Render Choices
 
 - Resolution: `1080x1920`
-- FPS: `25`, matching `E:/TTS/reference_videos/Mutsumi小视频/成品/mutsmi_4.mp4`.
+- FPS: `25`, matching the reference style used by this workflow.
 - Image fit: fill the frame with a 9:16 crop. Do not add black bars unless the user explicitly asks to preserve the full image.
 - Audio codec: AAC, 192 kbps.
 - BGM default: sidechain ducking on, volume `0.12`, fade in `1.5s`, fade out `3.0s`.
@@ -69,8 +69,8 @@ When the user sends a music file while making a video, use it as background musi
 - Subtitle text: no punctuation by default; wrap long entries with `--subtitle-max-chars 14` unless the user asks for a different density.
 - Subtitle safe area: keep horizontal and bottom margins so burned subtitles do not touch the frame edge.
 - Temporary copied source image, narration audio, BGM, and SRT sidecar are deleted by default after a burned-subtitle MP4 is exported. Pass `--keep-work-assets` only when those files are needed for manual editing.
-- ffmpeg path: `E:/TTS/GPT-SoVITS-v2pro-20250604/runtime/ffmpeg.exe`
-- ffprobe path: `E:/TTS/GPT-SoVITS-v2pro-20250604/runtime/ffprobe.exe`
+- ffmpeg path: configured in `config.json`, or pass `--ffmpeg`.
+- ffprobe path: configured in `config.json`, or pass `--ffprobe`.
 
 If the user requests a horizontal or square video, change `--resolution`.
 
@@ -79,7 +79,7 @@ If the user requests a horizontal or square video, change `--resolution`.
 Crop preview gate:
 
 ```powershell
-& "E:\TTS\GPT-SoVITS-v2pro-20250604\runtime\python.exe" `
+& "<GPT-SoVITS-root>\runtime\python.exe" `
   .\skills\single-image-tts-video\scripts\make_single_image_video.py `
   --image .\work\image.png `
   --crop-preview-only
@@ -88,7 +88,7 @@ Crop preview gate:
 Adjusted crop preview:
 
 ```powershell
-& "E:\TTS\GPT-SoVITS-v2pro-20250604\runtime\python.exe" `
+& "<GPT-SoVITS-root>\runtime\python.exe" `
   .\skills\single-image-tts-video\scripts\make_single_image_video.py `
   --image .\work\image.png `
   --crop-preview-only `
@@ -99,7 +99,7 @@ Adjusted crop preview:
 Run with the GPT-SoVITS runtime Python so Faster-Whisper is available:
 
 ```powershell
-& "E:\TTS\GPT-SoVITS-v2pro-20250604\runtime\python.exe" `
+& "<GPT-SoVITS-root>\runtime\python.exe" `
   .\skills\single-image-tts-video\scripts\make_single_image_video.py `
   --image .\work\image.png `
   --audio .\outputs\tts_final\final.wav `
@@ -109,7 +109,7 @@ Run with the GPT-SoVITS runtime Python so Faster-Whisper is available:
 Run with BGM:
 
 ```powershell
-& "E:\TTS\GPT-SoVITS-v2pro-20250604\runtime\python.exe" `
+& "<GPT-SoVITS-root>\runtime\python.exe" `
   .\skills\single-image-tts-video\scripts\make_single_image_video.py `
   --image .\work\image.png `
   --audio .\outputs\tts_final\final.wav `
@@ -124,7 +124,7 @@ If the BGM still competes with speech, rerun with `--bgm-volume 0.08`. Use `--no
 Use an existing SRT instead of generating one:
 
 ```powershell
-& "E:\TTS\GPT-SoVITS-v2pro-20250604\runtime\python.exe" `
+& "<GPT-SoVITS-root>\runtime\python.exe" `
   .\skills\single-image-tts-video\scripts\make_single_image_video.py `
   --image .\work\image.png `
   --audio .\outputs\tts_final\final.wav `
@@ -134,7 +134,7 @@ Use an existing SRT instead of generating one:
 Create horizontal output:
 
 ```powershell
-& "E:\TTS\GPT-SoVITS-v2pro-20250604\runtime\python.exe" `
+& "<GPT-SoVITS-root>\runtime\python.exe" `
   .\skills\single-image-tts-video\scripts\make_single_image_video.py `
   --image .\work\image.png `
   --audio .\outputs\tts_final\final.wav `
@@ -152,5 +152,5 @@ Create horizontal output:
 - When BGM is present, inspect the mix. Narration must remain clearly intelligible; lower BGM if it masks speech.
 - If ffmpeg cannot burn subtitles, keep the sidecar SRT and report that subtitles were not burned in.
 - If a real `.prproj` is required, use Premiere through desktop automation; otherwise the `premiere_aux` folder is the default PR-ready handoff.
-- To save space, run `tools/cleanup_temporary_assets.ps1` after large batches; it removes regenerated temp copies while keeping final videos, final WAVs, reports, manifests, and source originals under `E:/TTS/input_images`.
+- To save space, clean regenerated temp copies after large batches while keeping final videos, final WAVs, reports, manifests, and source originals.
 
