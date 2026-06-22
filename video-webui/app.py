@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import array
 import hashlib
 import json
 import os
@@ -1328,6 +1329,29 @@ def wav_duration_seconds(audio_path: Path) -> float | None:
     return None
 
 
+def audio_duration_seconds(config: AppConfig, audio_path: Path) -> float | None:
+    duration = wav_duration_seconds(audio_path)
+    if duration is not None:
+        return duration
+    command = [
+        str(config.ffprobe),
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+        str(audio_path),
+    ]
+    result = run_command(command, config.project_root, APP_ROOT / "ffprobe_duration.txt")
+    if result.returncode != 0:
+        return None
+    try:
+        return float(result.stdout.strip().splitlines()[-1])
+    except Exception:
+        return None
+
+
 def transcribe_model_to_segments(audio_path: Path, model: Any, language: str) -> list[dict[str, Any]]:
     duration = wav_duration_seconds(audio_path)
     segments, _info = model.transcribe(str(audio_path), language=language, vad_filter=False)
@@ -1343,6 +1367,148 @@ def transcribe_model_to_segments(audio_path: Path, model: Any, language: str) ->
         if text and end > start:
             parsed.append({"index": index, "start": start, "end": end, "text": text})
     return parsed
+
+
+def transcribe_model_to_segments_and_char_timeline(
+    audio_path: Path,
+    model: Any,
+    language: str,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    duration = wav_duration_seconds(audio_path)
+    try:
+        segment_iter, _info = model.transcribe(
+            str(audio_path),
+            language=language,
+            vad_filter=False,
+            word_timestamps=True,
+        )
+    except TypeError:
+        segment_iter, _info = model.transcribe(str(audio_path), language=language, vad_filter=False)
+
+    parsed: list[dict[str, Any]] = []
+    char_timeline: list[dict[str, Any]] = []
+    for index, segment in enumerate(segment_iter, start=1):
+        text = str(segment.text).strip()
+        start = float(segment.start)
+        end = float(segment.end)
+        if duration is not None:
+            if start >= duration + 0.25:
+                continue
+            end = min(end, duration)
+        if not text or end <= start:
+            continue
+        parsed.append({"index": index, "start": start, "end": end, "text": text})
+
+        words = list(getattr(segment, "words", None) or [])
+        if words:
+            for word in words:
+                word_text = str(getattr(word, "word", "") or "").strip()
+                normalized = normalize_text(word_text)
+                if not normalized:
+                    continue
+                word_start = max(start, float(getattr(word, "start", start) or start))
+                word_end = min(end, float(getattr(word, "end", end) or end))
+                if word_end <= word_start:
+                    word_start, word_end = start, end
+                step = (word_end - word_start) / max(1, len(normalized))
+                for offset, char in enumerate(normalized):
+                    char_timeline.append(
+                        {
+                            "char": char,
+                            "start": word_start + (step * offset),
+                            "end": word_start + (step * (offset + 1)),
+                        }
+                    )
+        else:
+            normalized = normalize_text(text)
+            step = (end - start) / max(1, len(normalized))
+            for offset, char in enumerate(normalized):
+                char_timeline.append(
+                    {
+                        "char": char,
+                        "start": start + (step * offset),
+                        "end": start + (step * (offset + 1)),
+                    }
+                )
+    return parsed, char_timeline
+
+
+def patch_unit_intervals_from_timeline(
+    config: AppConfig,
+    audio_path: Path,
+    segments: list[dict[str, Any]],
+    units: list[dict[str, Any]],
+    char_timeline: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    unit_norms = [normalize_text(str(unit.get("text") or "")) for unit in units]
+    expected = "".join(unit_norms)
+    actual = "".join(str(item.get("char") or "") for item in char_timeline)
+    expected_ranges: list[tuple[int, int]] = []
+    cursor = 0
+    for normalized in unit_norms:
+        start = cursor
+        cursor += len(normalized)
+        expected_ranges.append((start, cursor))
+
+    expected_to_actual: dict[int, int] = {}
+    if expected and actual and char_timeline:
+        matcher = SequenceMatcher(None, expected, actual, autojunk=False)
+        for tag, expected_start, expected_end, actual_start, _actual_end in matcher.get_opcodes():
+            if tag != "equal":
+                continue
+            for offset, expected_index in enumerate(range(expected_start, expected_end)):
+                expected_to_actual[expected_index] = actual_start + offset
+
+    fallback_srt = script_aligned_srt_from_blocks(config, audio_path, segments, [str(unit.get("text") or "") for unit in units])
+    fallback_blocks = parse_srt_blocks(fallback_srt)
+    duration = audio_duration_seconds(config, audio_path) or float(segments[-1]["end"] if segments else len(units))
+
+    intervals: list[dict[str, Any]] = []
+    for unit_index, ((expected_start, expected_end), unit) in enumerate(zip(expected_ranges, units), start=1):
+        mapped = [
+            expected_to_actual[index]
+            for index in range(expected_start, expected_end)
+            if index in expected_to_actual and 0 <= expected_to_actual[index] < len(char_timeline)
+        ]
+        confidence = 0.0 if expected_end <= expected_start else len(mapped) / max(1, expected_end - expected_start)
+        if mapped and confidence >= 0.35:
+            start = float(char_timeline[min(mapped)]["start"])
+            end = float(char_timeline[max(mapped)]["end"])
+            source = "word_timestamps"
+        else:
+            block = fallback_blocks[unit_index - 1] if unit_index - 1 < len(fallback_blocks) else {}
+            match = re.match(r"\s*(\d+:\d+:\d+,\d+)\s*-->\s*(\d+:\d+:\d+,\d+)", str(block.get("time") or ""))
+            if match:
+                start = parse_srt_timestamp(match.group(1))
+                end = parse_srt_timestamp(match.group(2))
+            else:
+                ratio_start = (unit_index - 1) / max(1, len(units))
+                ratio_end = unit_index / max(1, len(units))
+                start = duration * ratio_start
+                end = duration * ratio_end
+            source = "estimated"
+
+        start = max(0.0, min(duration, start))
+        end = max(start + 0.04, min(duration, end))
+        intervals.append(
+            {
+                "index": unit_index,
+                "start": start,
+                "end": end,
+                "confidence": confidence,
+                "source": source,
+            }
+        )
+
+    for index in range(1, len(intervals)):
+        previous = intervals[index - 1]
+        current = intervals[index]
+        if float(current["start"]) < float(previous["end"]):
+            boundary = (float(current["start"]) + float(previous["end"])) / 2.0
+            previous["end"] = max(float(previous["start"]) + 0.04, boundary)
+            current["start"] = min(float(current["end"]) - 0.04, boundary)
+
+    return intervals
 
 
 def segments_to_srt(segments: list[dict[str, Any]]) -> str:
@@ -2085,37 +2251,96 @@ def split_micro_tts_chunks(text: str) -> list[str]:
     return [chunk for chunk in chunks if normalize_text(chunk)]
 
 
-def split_patch_clause_units(text: str) -> list[str]:
+def strip_patch_boundary_punctuation(text: str) -> str:
+    return re.sub(r"^[\s，,、；;：:。！？!?.]+|[\s，,、；;：:。！？!?.]+$", "", text or "").strip()
+
+
+def split_patch_sentence_units(text: str) -> list[str]:
     cleaned = re.sub(r"[ \t]+", " ", (text or "").replace("\r\n", "\n")).strip()
     if not cleaned:
         return []
-    delimiters = "，,、；;：:"
+    delimiters = "。！？!?；;."
     units: list[str] = []
     buf: list[str] = []
     for char in cleaned:
-        buf.append(char)
-        if char in delimiters:
-            unit = "".join(buf).strip()
+        if char == "\n":
+            unit = strip_patch_boundary_punctuation("".join(buf))
             if normalize_text(unit):
                 units.append(unit)
             buf = []
-    tail = "".join(buf).strip()
+            continue
+        buf.append(char)
+        if char in delimiters:
+            unit = strip_patch_boundary_punctuation("".join(buf))
+            if normalize_text(unit):
+                units.append(unit)
+            buf = []
+    tail = strip_patch_boundary_punctuation("".join(buf))
+    if normalize_text(tail):
+        units.append(tail)
+    return units or ([strip_patch_boundary_punctuation(cleaned)] if normalize_text(cleaned) else [])
+
+
+def split_patch_clause_units(text: str) -> list[str]:
+    cleaned = re.sub(r"[ \t]+", " ", (text or "").replace("\r\n", "\n")).strip()
+    cleaned = strip_patch_boundary_punctuation(cleaned)
+    if not cleaned:
+        return []
+    delimiters = "，,、：:"
+    units: list[str] = []
+    buf: list[str] = []
+    for char in cleaned:
+        if char in delimiters:
+            unit = strip_patch_boundary_punctuation("".join(buf))
+            if normalize_text(unit):
+                units.append(unit)
+            buf = []
+            continue
+        buf.append(char)
+    tail = strip_patch_boundary_punctuation("".join(buf))
     if normalize_text(tail):
         units.append(tail)
     return units or [cleaned]
 
 
+def split_patch_minimal_units(text: str) -> list[dict[str, Any]]:
+    units: list[dict[str, Any]] = []
+    for sentence_index, sentence in enumerate(split_patch_sentence_units(text or ""), start=1):
+        clauses = split_patch_clause_units(sentence)
+        if not clauses:
+            continue
+        for clause_index, clause in enumerate(clauses, start=1):
+            units.append(
+                {
+                    "sequence_index": len(units) + 1,
+                    "sentence_index": sentence_index,
+                    "clause_index": clause_index,
+                    "locator": f"{sentence_index}.{clause_index}",
+                    "text": clause,
+                    "sentence": sentence,
+                }
+            )
+    return units
+
+
+def minimal_patch_chunks(text: str) -> list[str]:
+    return [str(unit["text"]) for unit in split_patch_minimal_units(text or "")]
+
+
 def manual_patch_listing(text: str, chunk_chars: int) -> str:
-    chunks = split_tts_chunks(text or "", chunk_chars)
+    chunks = split_patch_sentence_units(text or "")
     if not chunks:
         return "没有可列出的文案分段。"
-    lines = ["格式：3 表示第 3 个分段；3.2 表示第 3 个分段里的第 2 个逗号小句。", ""]
+    lines = [
+        "格式：3 表示第 3 个句号大分段；3.2 表示第 3 个大分段里的第 2 个逗号小分段。",
+        "连续小分段可一起生成，例如 3.1,3.2,3.3。",
+        "",
+    ]
     for index, chunk in enumerate(chunks, start=1):
         lines.append(f"{index}: {chunk}")
         clauses = split_patch_clause_units(chunk)
-        if len(clauses) > 1:
-            for clause_index, clause in enumerate(clauses, start=1):
-                lines.append(f"  {index}.{clause_index}: {clause}")
+        for clause_index, clause in enumerate(clauses, start=1):
+            lines.append(f"  {index}.{clause_index}: {clause}")
     return "\n".join(lines)
 
 
@@ -2308,18 +2533,195 @@ def chunks_signature(chunks: list[str]) -> str:
     return hashlib.sha1(payload.encode("utf-8")).hexdigest()
 
 
-def parse_patch_target_hint(hint: str, chunk_count: int) -> tuple[int | None, int | None]:
+def consecutive_int_groups(values: list[int]) -> list[list[int]]:
+    ordered = sorted(dict.fromkeys(values))
+    if not ordered:
+        return []
+    groups: list[list[int]] = [[ordered[0]]]
+    for value in ordered[1:]:
+        if value == groups[-1][-1] + 1:
+            groups[-1].append(value)
+        else:
+            groups.append([value])
+    return groups
+
+
+def patch_locator_text(chunk_index: int, clause_indices: list[int] | None = None, clause_index: int | None = None) -> str:
+    indices = list(clause_indices or [])
+    if not indices and clause_index:
+        indices = [clause_index]
+    if not indices:
+        return str(chunk_index)
+    return ",".join(f"{chunk_index}.{index}" for index in indices)
+
+
+def parse_patch_target_tokens(hint: str, chunk_count: int) -> list[tuple[int, int | None]]:
     raw = (hint or "").strip()
     if not raw:
+        return []
+    targets: list[tuple[int, int | None]] = []
+    invalid: list[str] = []
+    for token in [part for part in re.split(r"[\s,，;；、]+", raw) if part.strip()]:
+        normalized = token.strip().upper().replace("Ｓ", "S").replace("Ｃ", "C")
+        match = re.match(r"^S?0*(\d+)(?:[.。:_-]C?0*(\d+))?$", normalized)
+        if not match:
+            invalid.append(token)
+            continue
+        chunk_index = int(match.group(1))
+        clause_index = int(match.group(2)) if match.group(2) else None
+        if chunk_index < 1 or chunk_index > chunk_count:
+            invalid.append(token)
+            continue
+        targets.append((chunk_index, clause_index))
+    if invalid:
+        raise ValueError("目标编号格式应为 3、3.2，或连续小分段 3.1,3.2,3.3。无效项: " + ", ".join(invalid))
+    return targets
+
+
+def parse_patch_target_hint(hint: str, chunk_count: int) -> tuple[int | None, int | None]:
+    targets = parse_patch_target_tokens(hint, chunk_count)
+    if not targets:
         return None, None
-    match = re.match(r"^S?0*(\d+)(?:[.。_-]C?0*(\d+))?$", raw.upper())
-    if not match:
-        raise ValueError("目标编号格式应为 3 或 3.2。")
-    chunk_index = int(match.group(1))
-    clause_index = int(match.group(2)) if match.group(2) else None
-    if chunk_index < 1 or chunk_index > chunk_count:
-        raise ValueError(f"目标分段 {chunk_index} 超出范围。")
-    return chunk_index, clause_index
+    if len(targets) > 1:
+        raise ValueError("此处只接受一个目标编号；连续小分段请在单句补漏/替换试听中使用。")
+    return targets[0]
+
+
+def patch_units_from_sentence_chunks(chunks: list[str]) -> list[dict[str, Any]]:
+    units: list[dict[str, Any]] = []
+    for sentence_index, sentence in enumerate(chunks, start=1):
+        clauses = split_patch_clause_units(sentence)
+        if not clauses:
+            continue
+        for clause_index, clause in enumerate(clauses, start=1):
+            units.append(
+                {
+                    "sequence_index": len(units) + 1,
+                    "sentence_index": sentence_index,
+                    "clause_index": clause_index,
+                    "locator": f"{sentence_index}.{clause_index}",
+                    "text": clause,
+                    "sentence": sentence,
+                }
+            )
+    return units
+
+
+def join_patch_unit_texts(units: list[dict[str, Any]]) -> str:
+    if not units:
+        return ""
+    output = str(units[0].get("text") or "")
+    previous_sentence = int(units[0].get("sentence_index") or 0)
+    for unit in units[1:]:
+        current_sentence = int(unit.get("sentence_index") or 0)
+        separator = "。" if current_sentence != previous_sentence else "，"
+        output += separator + str(unit.get("text") or "")
+        previous_sentence = current_sentence
+    return output
+
+
+def patch_target_from_tokens(chunks: list[str], targets: list[tuple[int, int | None]], requested: str) -> dict[str, Any]:
+    if not targets:
+        raise ValueError("没有解析到有效目标编号。")
+    all_units = patch_units_from_sentence_chunks(chunks)
+    selected_units: list[dict[str, Any]] = []
+    invalid: list[str] = []
+
+    for chunk_index, clause_index in targets:
+        if chunk_index < 1 or chunk_index > len(chunks):
+            invalid.append(str(chunk_index))
+            continue
+        chunk_text = chunks[chunk_index - 1]
+        clauses = split_patch_clause_units(chunk_text)
+        if clause_index is None:
+            selected_units.extend(
+                unit
+                for unit in all_units
+                if int(unit.get("sentence_index") or 0) == chunk_index
+            )
+            continue
+        if clause_index < 1 or clause_index > len(clauses):
+            invalid.append(f"{chunk_index}.{clause_index}")
+            continue
+        selected_units.extend(
+            unit
+            for unit in all_units
+            if int(unit.get("sentence_index") or 0) == chunk_index
+            and int(unit.get("clause_index") or 0) == clause_index
+        )
+
+    if invalid:
+        raise ValueError("目标小分段超出范围: " + ", ".join(invalid))
+    if not selected_units:
+        raise ValueError("没有解析到有效目标编号。")
+
+    selected_units = sorted(
+        {int(unit["sequence_index"]): unit for unit in selected_units}.values(),
+        key=lambda unit: int(unit["sequence_index"]),
+    )
+    sequence_indices = [int(unit["sequence_index"]) for unit in selected_units]
+    groups = consecutive_int_groups(sequence_indices)
+    if len(groups) != 1:
+        raise ValueError("多个小分段必须在全文最小分段序列里连续，例如 3.2,4.1 或 3.1,3.2。")
+
+    first_unit = selected_units[0]
+    last_unit = selected_units[-1]
+    first_sentence_index = int(first_unit["sentence_index"])
+    first_clause_index = int(first_unit["clause_index"])
+    chunk_text = chunks[first_sentence_index - 1]
+    source_target_text = join_patch_unit_texts(selected_units)
+    target_locator = ",".join(str(unit["locator"]) for unit in selected_units)
+    clause_indices = [
+        int(unit["clause_index"])
+        for unit in selected_units
+        if int(unit["sentence_index"]) == first_sentence_index
+    ]
+
+    if len(selected_units) == len(split_patch_clause_units(chunk_text)) and first_sentence_index == int(last_unit["sentence_index"]):
+        return {
+            "chunk_index": first_sentence_index,
+            "clause_index": None,
+            "clause_indices": [],
+            "target_text": requested or source_target_text,
+            "source_chunk": chunk_text,
+            "source_target_text": source_target_text,
+            "target_units": selected_units,
+            "target_locator": target_locator,
+            "match_score": 1.0,
+            "has_target_hint": True,
+        }
+
+    return {
+        "chunk_index": first_sentence_index,
+        "clause_index": first_clause_index,
+        "clause_indices": clause_indices,
+        "target_text": requested or source_target_text,
+        "source_chunk": chunk_text,
+        "source_target_text": source_target_text,
+        "target_units": selected_units,
+        "target_locator": target_locator,
+        "match_score": 1.0,
+        "has_target_hint": True,
+    }
+
+
+def find_clause_indices_for_text(chunk: str, target_text: str) -> list[int]:
+    clauses = split_patch_clause_units(chunk)
+    target_norm = normalize_text(target_text)
+    if not clauses or not target_norm:
+        return []
+    for index, clause in enumerate(clauses, start=1):
+        clause_norm = normalize_text(clause)
+        if clause_norm == target_norm or target_norm in clause_norm or clause_norm in target_norm:
+            return [index]
+    for start in range(len(clauses)):
+        combined = ""
+        for end in range(start, len(clauses)):
+            combined += clauses[end]
+            combined_norm = normalize_text(combined)
+            if combined_norm == target_norm or target_norm in combined_norm or combined_norm in target_norm:
+                return list(range(start + 1, end + 2))
+    return []
 
 
 def sentence_candidate_score(target: str, candidate: str) -> float:
@@ -2341,32 +2743,14 @@ def resolve_sentence_patch_target(
     target_hint: str,
     chunk_chars: int,
 ) -> dict[str, Any]:
-    chunks = split_tts_chunks(source_text or "", chunk_chars)
+    chunks = split_patch_sentence_units(source_text or "")
     if not chunks:
-        raise ValueError("没有可用的 2b 分段，请先填写文案并运行 2b。")
+        raise ValueError("没有可用的句号大分段，请先填写文案。")
 
     requested = (patch_text or "").strip()
-    hint_chunk, hint_clause = parse_patch_target_hint(target_hint, len(chunks))
-    if hint_chunk is not None:
-        chunk_text = chunks[hint_chunk - 1]
-        clauses = split_patch_clause_units(chunk_text)
-        source_target_text = chunk_text
-        if hint_clause is not None:
-            if hint_clause < 1 or hint_clause > len(clauses):
-                raise ValueError(f"目标小句 {hint_chunk}.{hint_clause} 超出范围。")
-            source_target_text = clauses[hint_clause - 1]
-            target_text = requested or source_target_text
-        else:
-            target_text = requested or chunk_text
-        target = {
-            "chunk_index": hint_chunk,
-            "clause_index": hint_clause,
-            "target_text": target_text,
-            "source_chunk": chunk_text,
-            "source_target_text": source_target_text,
-            "match_score": 1.0,
-            "has_target_hint": True,
-        }
+    hint_targets = parse_patch_target_tokens(target_hint, len(chunks))
+    if hint_targets:
+        target = patch_target_from_tokens(chunks, hint_targets, requested)
     else:
         if not requested:
             raise ValueError("请填写要补漏或替换的单句文本，或填写目标编号。")
@@ -2376,6 +2760,7 @@ def resolve_sentence_patch_target(
             candidate = {
                 "chunk_index": chunk_index,
                 "clause_index": None,
+                "clause_indices": [],
                 "target_text": requested,
                 "source_chunk": chunk,
                 "source_target_text": chunk,
@@ -2389,6 +2774,7 @@ def resolve_sentence_patch_target(
                 candidate = {
                     "chunk_index": chunk_index,
                     "clause_index": clause_index,
+                    "clause_indices": [clause_index],
                     "target_text": requested,
                     "source_chunk": chunk,
                     "source_target_text": clause,
@@ -2401,6 +2787,7 @@ def resolve_sentence_patch_target(
             best = {
                 "chunk_index": len(chunks),
                 "clause_index": None,
+                "clause_indices": [],
                 "target_text": requested,
                 "source_chunk": chunks[-1],
                 "source_target_text": chunks[-1],
@@ -2412,13 +2799,19 @@ def resolve_sentence_patch_target(
     score, coverage, _start, _end, matched = best_fuzzy_window(str(target["target_text"]), strip_srt_text(current_srt or ""))
     missing = score < 0.65 or coverage < 0.55
     source_target = str(target.get("source_target_text") or target.get("source_chunk") or "")
-    is_targeted_rewrite = bool(requested) and bool(target.get("has_target_hint")) and sentence_candidate_score(requested, source_target) < 0.86
-    action = "replace" if is_targeted_rewrite else ("insert" if missing else "replace")
+    has_target_hint = bool(target.get("has_target_hint"))
+    is_targeted_rewrite = bool(requested) and has_target_hint and sentence_candidate_score(requested, source_target) < 0.86
+    action = "replace" if has_target_hint else ("insert" if missing else "replace")
+    action_reason = (
+        "manual locator replacement"
+        if has_target_hint
+        else ("missing in raw ASR" if missing else "present in raw ASR")
+    )
     target.update(
         {
             "chunks": chunks,
             "action": action,
-            "action_reason": "targeted rewrite" if is_targeted_rewrite else ("missing in raw ASR" if missing else "present in raw ASR"),
+            "action_reason": "targeted rewrite" if is_targeted_rewrite else action_reason,
             "missing": missing,
             "srt_score": score,
             "srt_coverage": coverage,
@@ -2470,6 +2863,26 @@ def save_audio_sequence(job: Path, chunks: list[str], entries: list[dict[str, An
     return path
 
 
+def load_audio_sequence_for_patch(job: Path, text: str, chunk_chars: int) -> tuple[list[str], list[dict[str, Any]]]:
+    candidates = [
+        minimal_patch_chunks(text or ""),
+        split_patch_sentence_units(text or ""),
+        split_tts_chunks(text or "", chunk_chars),
+    ]
+    seen: set[str] = set()
+    errors: list[str] = []
+    for chunks in candidates:
+        signature = chunks_signature(chunks)
+        if not chunks or signature in seen:
+            continue
+        seen.add(signature)
+        try:
+            return chunks, load_audio_sequence(job, chunks)
+        except Exception as exc:
+            errors.append(str(exc))
+    raise ValueError("当前任务没有可用的音频分段索引；请先点击“3. 建立修补分段索引”。" + ("\n" + "\n".join(errors[-2:]) if errors else ""))
+
+
 def sequence_insert_position(entries: list[dict[str, Any]], chunk_index: int) -> int:
     for index, entry in enumerate(entries):
         if int(entry.get("chunk_index") or 0) >= chunk_index:
@@ -2477,12 +2890,44 @@ def sequence_insert_position(entries: list[dict[str, Any]], chunk_index: int) ->
     return len(entries)
 
 
+def export_sentence_patch_audio_file(job: Path, candidate: dict[str, Any], candidate_audio: Path) -> tuple[Path, Path]:
+    if not candidate_audio.exists():
+        raise FileNotFoundError(f"单句候选音频不存在: {candidate_audio}")
+    chunk_index = int(candidate.get("chunk_index") or 0)
+    raw_clause_indices = candidate.get("clause_indices") or []
+    clause_indices = [int(index) for index in raw_clause_indices if str(index).strip()] if isinstance(raw_clause_indices, list) else []
+    clause_index = int(candidate.get("clause_index") or 0) or None
+    locator = str(candidate.get("target_locator") or "") or (patch_locator_text(chunk_index, clause_indices, clause_index) if chunk_index else "manual")
+    action = "insert" if candidate.get("action") == "insert" else "replace"
+    target_text = str(candidate.get("target_text") or "").strip()
+    text_slug = safe_name(target_text[:24] or candidate_audio.stem)
+    suffix = candidate_audio.suffix or ".wav"
+    export_dir = job / "exports" / "premiere_patch"
+    export_dir.mkdir(parents=True, exist_ok=True)
+    base_name = safe_name(f"{now_slug()}_{action}_{locator}_{text_slug}")
+    export_audio = export_dir / f"{base_name}{suffix}"
+    shutil.copy2(candidate_audio, export_audio)
+
+    meta_path = export_dir / f"{base_name}.txt"
+    meta_lines = [
+        f"audio: {export_audio}",
+        f"source_audio: {candidate_audio}",
+        f"action: {action}",
+        f"target: {locator}",
+        f"text: {target_text}",
+        f"report: {candidate.get('report') or ''}",
+        f"created_at: {now_slug()}",
+    ]
+    meta_path.write_text("\n".join(meta_lines), encoding="utf-8")
+    return export_audio, meta_path
+
+
 def rebuild_chunk_with_clause_candidate(
     config: AppConfig,
     job: Path,
     chunk: str,
     chunk_index: int,
-    clause_index: int,
+    clause_indices: int | list[int],
     candidate_audio: Path,
     voice_config: Path,
     asr_model: Any,
@@ -2492,12 +2937,20 @@ def rebuild_chunk_with_clause_candidate(
     patch_root: Path,
 ) -> Path:
     clauses = split_patch_clause_units(chunk)
-    if clause_index < 1 or clause_index > len(clauses):
+    if isinstance(clause_indices, int):
+        replace_indices = [clause_indices]
+    else:
+        replace_indices = [int(index) for index in clause_indices]
+    replace_indices = sorted(dict.fromkeys(index for index in replace_indices if 1 <= index <= len(clauses)))
+    if not replace_indices:
         return candidate_audio
+    first_replace_index = replace_indices[0]
+    replace_index_set = set(replace_indices)
     clause_audios: list[Path] = []
     for current_index, clause in enumerate(clauses, start=1):
-        if current_index == clause_index:
-            clause_audios.append(candidate_audio)
+        if current_index in replace_index_set:
+            if current_index == first_replace_index:
+                clause_audios.append(candidate_audio)
             continue
         audio_path, _lines, _passed = synthesize_best_chunk_audio(
             config,
@@ -2705,7 +3158,34 @@ def synthesize_clause_rebuilt_segment_audio(
 
     clause_audios: list[Path] = []
     all_passed = True
-    for clause_index, clause in enumerate(clauses, start=1):
+    focus_indices = [
+        int(row["index"])
+        for row in focus_rows or []
+        if 1 <= int(row.get("index") or 0) <= len(clauses)
+    ]
+    grouped_focus = {
+        group[0]: group
+        for group in consecutive_int_groups(focus_indices)
+        if len(group) > 1
+    }
+    clause_index = 1
+    while clause_index <= len(clauses):
+        group = grouped_focus.get(clause_index)
+        if group:
+            clause = "，".join(clauses[index - 1] for index in group)
+            report_lines.extend(
+                [
+                    f"### {report_label} {index:03d} clauses {group[0]:02d}-{group[-1]:02d}",
+                    "",
+                    "Continuous manual clause sequence; generating as one replacement sentence.",
+                    f"- Text: `{clause}`",
+                    "",
+                ]
+            )
+            next_clause_index = group[-1] + 1
+        else:
+            clause = clauses[clause_index - 1]
+            next_clause_index = clause_index + 1
         clause_audio, clause_lines, clause_passed = synthesize_best_chunk_audio(
             config,
             job,
@@ -2724,6 +3204,7 @@ def synthesize_clause_rebuilt_segment_audio(
         clause_audios.append(clause_audio)
         all_passed = all_passed and clause_passed
         report_lines.extend(clause_lines)
+        clause_index = next_clause_index
 
     rebuilt_audio = concat_audio_with_padding(
         config,
@@ -2902,6 +3383,205 @@ def prepend_audio_silence(config: AppConfig, source: Path, output: Path, pad_sec
     if result.returncode != 0:
         raise RuntimeError(result.stderr[-3000:] or result.stdout[-3000:])
     return output.resolve()
+
+
+def cut_audio_segment(config: AppConfig, source: Path, output: Path, start: float, end: float, log_path: Path) -> Path:
+    start = max(0.0, float(start or 0.0))
+    end = max(start + 0.03, float(end or 0.0))
+    output.parent.mkdir(parents=True, exist_ok=True)
+    command = [
+        str(config.ffmpeg),
+        "-y",
+        "-ss",
+        f"{start:.3f}",
+        "-t",
+        f"{max(0.03, end - start):.3f}",
+        "-i",
+        str(source),
+        "-ar",
+        "44100",
+        "-ac",
+        "2",
+        "-c:a",
+        "pcm_s16le",
+        str(output),
+    ]
+    result = run_command(command, config.project_root, log_path)
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr[-3000:] or result.stdout[-3000:])
+    return output.resolve()
+
+
+def make_analysis_wav(config: AppConfig, source: Path, output: Path, log_path: Path) -> Path:
+    output.parent.mkdir(parents=True, exist_ok=True)
+    command = [
+        str(config.ffmpeg),
+        "-y",
+        "-i",
+        str(source),
+        "-ar",
+        "16000",
+        "-ac",
+        "1",
+        "-c:a",
+        "pcm_s16le",
+        str(output),
+    ]
+    result = run_command(command, config.project_root, log_path)
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr[-3000:] or result.stdout[-3000:])
+    return output.resolve()
+
+
+def read_mono_i16_wav(path: Path) -> tuple[array.array, int]:
+    with wave.open(str(path), "rb") as handle:
+        if handle.getnchannels() != 1 or handle.getsampwidth() != 2:
+            raise ValueError(f"analysis wav must be mono s16: {path}")
+        rate = handle.getframerate()
+        payload = handle.readframes(handle.getnframes())
+    samples = array.array("h")
+    samples.frombytes(payload)
+    if sys.byteorder == "big":
+        samples.byteswap()
+    return samples, rate
+
+
+def quiet_boundary_in_analysis_wav(
+    analysis_wav: Path,
+    boundary: float,
+    search_start: float,
+    search_end: float,
+) -> float:
+    samples, rate = read_mono_i16_wav(analysis_wav)
+    if rate <= 0 or not samples:
+        return boundary
+    duration = len(samples) / float(rate)
+    search_start = max(0.0, min(duration, search_start))
+    search_end = max(search_start, min(duration, search_end))
+    if search_end - search_start < 0.015:
+        return max(search_start, min(search_end, boundary))
+
+    start_sample = int(search_start * rate)
+    end_sample = min(len(samples), int(search_end * rate))
+    window = max(1, int(0.028 * rate))
+    step = max(1, int(0.006 * rate))
+    if end_sample - start_sample <= window:
+        return (search_start + search_end) / 2.0
+
+    abs_values = [abs(value) for value in samples[start_sample:end_sample]]
+    prefix = [0]
+    for value in abs_values:
+        prefix.append(prefix[-1] + value)
+    max_energy = max(1.0, max(abs_values) if abs_values else 1.0)
+    span = max(0.001, search_end - search_start)
+    best_score: float | None = None
+    best_time = boundary
+    for offset in range(0, len(abs_values) - window + 1, step):
+        energy = (prefix[offset + window] - prefix[offset]) / float(window)
+        center_sample = start_sample + offset + (window // 2)
+        candidate_time = center_sample / float(rate)
+        distance_penalty = (abs(candidate_time - boundary) / span) * max_energy * 0.12
+        score = energy + distance_penalty
+        if best_score is None or score < best_score:
+            best_score = score
+            best_time = candidate_time
+    return max(search_start, min(search_end, best_time))
+
+
+def concat_audio_with_crossfade(config: AppConfig, audio_paths: list[Path], output: Path, fade_seconds: float, work_dir: Path) -> Path:
+    if not audio_paths:
+        raise ValueError("No audio segments to concatenate.")
+    if len(audio_paths) == 1:
+        output.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(audio_paths[0], output)
+        return output.resolve()
+    fade_seconds = max(0.0, min(0.08, float(fade_seconds or 0.0)))
+    if fade_seconds <= 0:
+        return concat_audio_with_padding(config, audio_paths, output, 0.0, work_dir)
+    durations = [audio_duration_seconds(config, path) for path in audio_paths]
+    known_durations = [float(value) for value in durations if value is not None and value > 0]
+    if known_durations:
+        fade_seconds = min(fade_seconds, max(0.0, min(known_durations) / 3.0))
+    if fade_seconds < 0.008:
+        return concat_audio_with_padding(config, audio_paths, output, 0.0, work_dir)
+
+    work_dir.mkdir(parents=True, exist_ok=True)
+    command = [str(config.ffmpeg), "-y"]
+    for path in audio_paths:
+        command.extend(["-i", str(path)])
+
+    filters: list[str] = []
+    for index in range(len(audio_paths)):
+        filters.append(
+            f"[{index}:a]aresample=44100,aformat=sample_fmts=s16:channel_layouts=stereo[a{index}]"
+        )
+    current = "a0"
+    for index in range(1, len(audio_paths)):
+        out_label = f"xf{index}"
+        filters.append(f"[{current}][a{index}]acrossfade=d={fade_seconds:.3f}:c1=tri:c2=tri[{out_label}]")
+        current = out_label
+    output.parent.mkdir(parents=True, exist_ok=True)
+    command.extend(
+        [
+            "-filter_complex",
+            ";".join(filters),
+            "-map",
+            f"[{current}]",
+            "-c:a",
+            "pcm_s16le",
+            str(output),
+        ]
+    )
+    result = run_command(command, config.project_root, work_dir / "crossfade_concat.txt")
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr[-3000:] or result.stdout[-3000:])
+    return output.resolve()
+
+
+def splice_audio_replace_range(
+    config: AppConfig,
+    source: Path,
+    patch_audio: Path,
+    output: Path,
+    start: float,
+    end: float,
+    work_dir: Path,
+) -> Path:
+    duration = audio_duration_seconds(config, source)
+    if duration is None:
+        raise RuntimeError(f"无法读取音频时长: {source}")
+    start = max(0.0, min(float(start or 0.0), duration))
+    end = max(start, min(float(end or start), duration))
+    if end <= start:
+        raise ValueError("替换区间无效，无法裁掉原音频片段。")
+
+    try:
+        analysis_wav = make_analysis_wav(config, source, work_dir / "analysis_mono.wav", work_dir / "analysis_wav.txt")
+        refined_start = quiet_boundary_in_analysis_wav(
+            analysis_wav,
+            start,
+            start,
+            min(end - 0.05, start + 0.35),
+        )
+        refined_end = quiet_boundary_in_analysis_wav(
+            analysis_wav,
+            end,
+            max(refined_start + 0.05, end - 0.35),
+            end,
+        )
+        if refined_end - refined_start >= 0.05:
+            start, end = refined_start, refined_end
+    except Exception:
+        pass
+
+    parts: list[Path] = []
+    work_dir.mkdir(parents=True, exist_ok=True)
+    if start > 0.02:
+        parts.append(cut_audio_segment(config, source, work_dir / "before.wav", 0.0, start, work_dir / "cut_before.txt"))
+    parts.append(patch_audio)
+    if duration - end > 0.02:
+        parts.append(cut_audio_segment(config, source, work_dir / "after.wav", end, duration, work_dir / "cut_after.txt"))
+    return concat_audio_with_crossfade(config, parts, output, 0.035, work_dir / "concat")
 
 
 def shift_srt_timestamps(srt_text: str, offset_seconds: float) -> str:
@@ -3090,13 +3770,10 @@ def create_ui(config: AppConfig):
         with gr.Row(elem_classes=["command-bar"]):
             btn_prepare = gr.Button("1. 准备任务")
             btn_tts = gr.Button("2. 生成 TTS")
-            btn_tts_repair = gr.Button("2b. 分段 TTS 自动修复")
-            btn_crop = gr.Button("3. 生成裁切预览")
-            btn_asr = gr.Button("4. Faster-Whisper 字幕")
-            btn_retime_srt = gr.Button("4b. 按编辑器重排时间轴")
-            btn_secondary_review = gr.Button("5. 审核音频/字幕")
-            btn_secondary_patch = gr.Button("6. 自动补漏句")
-            btn_render = gr.Button("7. 渲染视频", variant="primary")
+            btn_tts_repair = gr.Button("3. 建立修补分段索引")
+            btn_crop = gr.Button("4. 生成裁切预览")
+            btn_asr = gr.Button("5. 字幕生成/重排/审核")
+            btn_render = gr.Button("6. 渲染视频", variant="primary")
 
         with gr.Accordion("SRT 校对与任务目录", open=False):
             with gr.Row(elem_classes=["dense-row"]):
@@ -3122,30 +3799,24 @@ def create_ui(config: AppConfig):
                     placeholder="留空则读取 AGENT_REVIEW_API_KEY",
                 )
             srt_editor = gr.Textbox(label="SRT 校对编辑器", lines=10, elem_classes=["srt-editor"])
-            with gr.Row(elem_classes=["dense-row"]):
-                manual_patch_targets = gr.Textbox(
-                    label="手动补修编号",
-                    placeholder="如 3 或 3.2，多项用逗号分隔；留空则 6 自动检测",
-                    scale=3,
-                )
-                btn_list_manual_patch = gr.Button("列出补修编号", scale=1)
-            manual_patch_options = gr.Textbox(label="可补修分段/小句", lines=8, elem_classes=["srt-editor"])
             review_report = gr.Textbox(label="二次审核报告", lines=10, elem_classes=["srt-editor"])
             with gr.Accordion("单句补漏 / 替换试听", open=True):
+                with gr.Row(elem_classes=["dense-row"]):
+                    btn_list_manual_patch = gr.Button("列出补修编号", scale=1)
+                manual_patch_options = gr.Textbox(label="可补修分段/小句", lines=8, elem_classes=["srt-editor"])
                 sentence_patch_text = gr.Textbox(
                     label="单句文本",
-                    placeholder="填写要补漏或重新修饰的一句；也可配合目标编号 3 或 3.2 精确定位",
+                    placeholder="填写要补漏或重新修饰的一句；或先在目标编号填 3 / 3.2 / 3.1,3.2 自动匹配文本",
                     lines=2,
                 )
                 with gr.Row(elem_classes=["dense-row"]):
                     sentence_patch_target = gr.Textbox(
                         label="目标编号（可选）",
-                        placeholder="例如 3 或 3.2；留空则按文本自动匹配",
+                        placeholder="例如 3 或 3.2；连续小段如 3.1,3.2,3.3",
                         scale=1,
                     )
-                    btn_sentence_patch_preview = gr.Button("6a. 生成单句试听", scale=1)
-                    btn_sentence_patch_apply = gr.Button("6b. 应用到当前音频", scale=1)
-                    btn_sentence_patch_export = gr.Button("6c. 导出给 PR", scale=1)
+                    btn_sentence_patch_preview = gr.Button("生成单句试听", scale=1)
+                    btn_sentence_patch_apply = gr.Button("应用到当前音频", scale=1)
                 with gr.Row(elem_classes=["dense-row"]):
                     sentence_speed = gr.Slider(0.6, 1.6, value=default_speed, step=0.01, label="单句语速")
                     sentence_fragment = gr.Slider(0.0, 1.5, value=default_fragment, step=0.05, label="单句停顿")
@@ -3154,7 +3825,6 @@ def create_ui(config: AppConfig):
                     sentence_top_p = gr.Slider(0.0, 1.0, value=default_top_p, step=0.05, label="单句 top_p")
                     sentence_temperature = gr.Slider(0.1, 2.0, value=default_temperature, step=0.05, label="单句 temperature")
                     sentence_patch_audio = gr.Audio(label="单句试听", type="filepath")
-                sentence_patch_export_path = gr.Textbox(label="PR 单句导出路径")
             with gr.Accordion("发布准备", open=True):
                 with gr.Row(elem_classes=["dense-row"]):
                     publish_platform = gr.Dropdown(
@@ -3168,7 +3838,7 @@ def create_ui(config: AppConfig):
                         placeholder="留空则使用刚渲染的视频，或自动查找当前任务最新 MP4",
                         scale=3,
                     )
-                    btn_prepare_publish = gr.Button("7. 生成发布包", scale=1)
+                    btn_prepare_publish = gr.Button("生成发布包", scale=1)
                 with gr.Row(elem_classes=["dense-row"]):
                     publish_title = gr.Textbox(
                         label="标题（可选）",
@@ -3547,7 +4217,7 @@ def create_ui(config: AppConfig):
                 chunk_chars = int(chunk_chars_value or 70)
                 retries = max(0, min(4, int(retries_value or 0)))
                 pass_cer = max(0.02, min(0.30, float(pass_cer_value or 0.14)))
-                pad_seconds = max(0.0, min(0.8, float(pad_ms_value or 0.0) / 1000.0))
+                pad_seconds = 0.0 if indexed_by_locator else max(0.0, min(0.8, float(pad_ms_value or 0.0) / 1000.0))
                 chunks = split_tts_chunks(text, chunk_chars)
                 if not chunks:
                     raise ValueError("分段结果为空，请检查旁白文案。")
@@ -3700,6 +4370,114 @@ def create_ui(config: AppConfig):
                 return str(srt_path), format_srt_for_editor(config, srt_text), report + f"\nSRT: {srt_path}\nRaw ASR SRT: {raw_srt_path}"
             except Exception:
                 return "", "", traceback.format_exc()
+
+        def build_manual_patch_audio_index(job_value: str, audio_value: str, text: str, text_lang_value: str):
+            try:
+                if not job_value:
+                    raise ValueError("请先点击“准备任务”。")
+                if not audio_value:
+                    raise ValueError("请先生成或上传旁白音频。")
+                if not (text or "").strip():
+                    raise ValueError("请先输入旁白原文。")
+                job = Path(job_value)
+                audio_path = Path(audio_value)
+                if not audio_path.exists():
+                    raise FileNotFoundError(f"当前音频不存在: {audio_path}")
+
+                units = split_patch_minimal_units(text or "")
+                if not units:
+                    raise ValueError("没有可建立索引的句号/逗号分段。")
+
+                from faster_whisper import WhisperModel  # type: ignore
+
+                asr_model = WhisperModel(str(config.asr_model), device="cpu", compute_type="int8")
+                segments, char_timeline = transcribe_model_to_segments_and_char_timeline(audio_path, asr_model, asr_language(text_lang_value))
+                raw_srt_text = segments_to_srt(segments)
+                intervals = patch_unit_intervals_from_timeline(config, audio_path, segments, units, char_timeline)
+                indexed_srt = "\n\n".join(
+                    make_srt_block(index, float(interval["start"]), float(interval["end"]), str(unit["text"]))
+                    for index, (unit, interval) in enumerate(zip(units, intervals), start=1)
+                ).strip() + "\n"
+                srt_path = write_text(job / "asr" / "subtitles.manual_patch_index.srt", indexed_srt)
+                raw_srt_path = write_text(job / "asr" / "subtitles.manual_patch_index.raw_asr.srt", raw_srt_text)
+
+                if len(intervals) != len(units):
+                    raise RuntimeError("分段索引数量与字幕时间轴数量不一致。")
+                segment_root = job / "tts" / "source_audio_segments"
+                entries: list[dict[str, Any]] = []
+                for unit, interval in zip(units, intervals):
+                    start = float(interval["start"])
+                    end = float(interval["end"])
+                    segment_audio = cut_audio_segment(
+                        config,
+                        audio_path,
+                        segment_root / f"{int(unit['sequence_index']):03d}_{safe_name(str(unit['locator']))}.wav",
+                        start,
+                        end,
+                        job / "logs" / f"manual_patch_cut_{int(unit['sequence_index']):03d}.txt",
+                    )
+                    entries.append(
+                        {
+                            "kind": "source_segment",
+                            "chunk_index": int(unit["sequence_index"]),
+                            "sentence_index": int(unit["sentence_index"]),
+                            "clause_index": int(unit["clause_index"]),
+                            "locator": str(unit["locator"]),
+                            "text": str(unit["text"]),
+                            "target_norm": normalize_text(str(unit["text"])),
+                            "source_audio": str(audio_path),
+                            "start": start,
+                            "end": end,
+                            "alignment_source": str(interval.get("source") or ""),
+                            "alignment_confidence": float(interval.get("confidence") or 0.0),
+                            "audio": str(segment_audio),
+                        }
+                    )
+
+                chunks = [str(unit["text"]) for unit in units]
+                sequence_path = save_audio_sequence(job, chunks, entries)
+                listing = manual_patch_listing(text or "", 0)
+                report_path = job / "checks" / "manual_patch_audio_index.md"
+                report_path.write_text(
+                    "\n".join(
+                        [
+                            "# Manual Patch Audio Index",
+                            "",
+                            f"- Source audio: `{audio_path}`",
+                            f"- Segments: {len(entries)}",
+                            f"- SRT: `{srt_path}`",
+                            f"- Raw ASR SRT: `{raw_srt_path}`",
+                            f"- Sequence: `{sequence_path}`",
+                            f"- Word timestamp chars: {len(char_timeline)}",
+                            "",
+                            "## Locator Map",
+                            "",
+                            *[
+                                f"- {entry['locator']} [{entry['start']:.3f}-{entry['end']:.3f}s, "
+                                f"{entry['alignment_source']}, confidence={entry['alignment_confidence']:.2f}]: "
+                                f"`{entry['text']}` -> `{entry['audio']}`"
+                                for entry in entries
+                            ],
+                        ]
+                    ),
+                    encoding="utf-8",
+                )
+                message = "\n".join(
+                    [
+                        "已从当前整段音频建立手动修补分段索引",
+                        "本步骤没有重新 TTS；只做一次 ASR 时间轴和本地音频切片。",
+                        "现在可以在“单句补漏 / 替换试听”的目标编号里输入 3、3.2 或 3.1,3.2。",
+                        f"Segments: {len(entries)}",
+                        f"SRT: {srt_path}",
+                        f"Raw ASR SRT: {raw_srt_path}",
+                        f"Sequence: {sequence_path}",
+                        f"Word timestamp chars: {len(char_timeline)}",
+                        f"Report: {report_path}",
+                    ]
+                )
+                return str(audio_path), str(audio_path), str(srt_path), format_srt_for_editor(config, indexed_srt), listing, message
+            except Exception:
+                return None, audio_value or "", "", "", traceback.format_exc(), traceback.format_exc()
 
         def retime_srt_from_editor(job_value: str, audio_value: str, srt_text: str, text: str, text_lang_value: str):
             try:
@@ -3877,6 +4655,26 @@ def create_ui(config: AppConfig):
             except Exception:
                 return traceback.format_exc()
 
+        def sentence_patch_target_to_text(text: str, target_hint: str):
+            raw = (target_hint or "").strip()
+            if not raw:
+                return gr.update(), "目标编号为空；可直接填写单句文本，或输入 3 / 3.2 / 3.1,3.2。"
+            try:
+                chunks = split_patch_sentence_units(text or "")
+                if not chunks:
+                    raise ValueError("请先输入旁白文案。")
+                targets = parse_patch_target_tokens(raw, len(chunks))
+                target = patch_target_from_tokens(chunks, targets, "")
+                matched_text = str(target.get("source_target_text") or target.get("target_text") or "").strip()
+                locator = str(target.get("target_locator") or "") or patch_locator_text(
+                    int(target["chunk_index"]),
+                    [int(index) for index in target.get("clause_indices") or []],
+                    int(target["clause_index"]) if target.get("clause_index") else None,
+                )
+                return matched_text, f"已匹配目标 {locator}\nText: {matched_text}"
+            except Exception as exc:
+                return gr.update(), f"目标编号未匹配：{exc}"
+
         def secondary_auto_patch(
             job_value: str,
             audio_value: str,
@@ -3946,7 +4744,7 @@ def create_ui(config: AppConfig):
                 segment_entries = parse_segmented_repair_segments(job)
                 segment_rebuild = False
                 segment_audio_by_index: dict[int, Path] = {}
-                fresh_chunks = split_tts_chunks(text, chunk_chars)
+                fresh_chunks = split_patch_sentence_units(text) if manual_patch_value else split_tts_chunks(text, chunk_chars)
                 if segment_entries:
                     report_chunks = [str(entry["expected"]) for entry in segment_entries]
                     chunks_match_current_split = (
@@ -4145,6 +4943,138 @@ def create_ui(config: AppConfig):
             except Exception:
                 return None, audio_value or "", "", srt_text or "", "", traceback.format_exc()
 
+        def generate_tts_repaired_then_auto_patch(
+            job_value: str,
+            label: str,
+            text: str,
+            gpt_weights_value: str,
+            sovits_weights_value: str,
+            reference_id_value: str,
+            ref_audio_upload: Any,
+            reference_text_value: str,
+            no_ref_text_value: bool,
+            prompt_lang_value: str,
+            text_lang_value: str,
+            text_split_value: str,
+            speed_value: float,
+            fragment_value: float,
+            top_k_value: float,
+            top_p_value: float,
+            temperature_value: float,
+            chunk_chars_value: float,
+            retries_value: float,
+            pass_cer_value: float,
+            pad_ms_value: float,
+        ):
+            repaired_audio, repaired_state, repaired_srt_state, repaired_editor, repair_message = generate_tts_repaired(
+                job_value,
+                label,
+                text,
+                gpt_weights_value,
+                sovits_weights_value,
+                reference_id_value,
+                ref_audio_upload,
+                reference_text_value,
+                no_ref_text_value,
+                prompt_lang_value,
+                text_lang_value,
+                text_split_value,
+                speed_value,
+                fragment_value,
+                top_k_value,
+                top_p_value,
+                temperature_value,
+                chunk_chars_value,
+                retries_value,
+                pass_cer_value,
+                pad_ms_value,
+            )
+            if not repaired_state:
+                return repaired_audio, repaired_state, repaired_srt_state, repaired_editor, repair_message
+
+            patched_audio, patched_state, patched_srt_state, patched_editor, final_review, patch_message = secondary_auto_patch(
+                job_value,
+                repaired_state,
+                text,
+                repaired_editor,
+                "",
+                label,
+                gpt_weights_value,
+                sovits_weights_value,
+                reference_id_value,
+                ref_audio_upload,
+                reference_text_value,
+                no_ref_text_value,
+                prompt_lang_value,
+                text_lang_value,
+                text_split_value,
+                speed_value,
+                fragment_value,
+                top_k_value,
+                top_p_value,
+                temperature_value,
+                chunk_chars_value,
+                retries_value,
+                pass_cer_value,
+                pad_ms_value,
+            )
+            if not patched_state:
+                return (
+                    repaired_audio,
+                    repaired_state,
+                    repaired_srt_state,
+                    repaired_editor,
+                    "\n\n".join(["分段 TTS 已完成，但自动补漏阶段未完成。", repair_message, patch_message]),
+                )
+            return (
+                patched_audio,
+                patched_state,
+                patched_srt_state,
+                patched_editor,
+                "\n\n".join(["分段 TTS + 自动补漏完成", repair_message, patch_message]),
+            )
+
+        def subtitle_retime_and_review(
+            job_value: str,
+            audio_value: str,
+            text: str,
+            srt_text: str,
+            text_lang_value: str,
+            mode_value: str,
+            api_url_value: str,
+            agent_model_value: str,
+            agent_api_key_value: str,
+        ):
+            try:
+                if not (srt_text or "").strip():
+                    srt_path, editor_text, first_message = make_asr(job_value, audio_value, text, text_lang_value)
+                    first_step = "4. Faster-Whisper 字幕"
+                else:
+                    srt_path, editor_text, first_message = retime_srt_from_editor(job_value, audio_value, srt_text, text, text_lang_value)
+                    first_step = "4b. 按编辑器重排时间轴"
+                if not srt_path:
+                    return "", editor_text or srt_text or "", first_message, ""
+                if not (text or "").strip():
+                    return srt_path, editor_text, first_message + "\n未提供原文，已跳过二次审核。", ""
+
+                review_status, reviewed_srt_path, reviewed_editor, final_report = secondary_review(
+                    job_value,
+                    audio_value,
+                    text,
+                    editor_text,
+                    text_lang_value,
+                    mode_value,
+                    api_url_value,
+                    agent_model_value,
+                    agent_api_key_value,
+                )
+                output_srt = reviewed_srt_path or srt_path
+                output_editor = reviewed_editor or editor_text
+                message = "\n\n".join([first_step + " 完成", first_message, "5. 审核完成", review_status])
+                return output_srt, output_editor, message, final_report
+            except Exception:
+                return "", srt_text or "", traceback.format_exc(), ""
+
         def generate_sentence_patch_candidate(
             job_value: str,
             audio_value: str,
@@ -4240,6 +5170,10 @@ def create_ui(config: AppConfig):
                     "target_text": target_text,
                     "chunk_index": int(target["chunk_index"]),
                     "clause_index": target.get("clause_index"),
+                    "clause_indices": target.get("clause_indices") or [],
+                    "target_units": target.get("target_units") or [],
+                    "target_locator": target.get("target_locator") or "",
+                    "chunks": target.get("chunks") or [],
                     "source_chunk": target.get("source_chunk"),
                     "source_target_text": target.get("source_target_text"),
                     "action": target.get("action"),
@@ -4254,10 +5188,18 @@ def create_ui(config: AppConfig):
                     "report": str(report_path),
                     "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
                 }
+                export_audio, export_meta = export_sentence_patch_audio_file(job, candidate, audio_path)
+                candidate["source_audio"] = str(audio_path)
+                candidate["audio"] = str(export_audio)
+                candidate["export_meta"] = str(export_meta)
                 state_path = job / "tmp" / "sentence_patch_candidate.json"
                 state_path.write_text(json.dumps(candidate, ensure_ascii=False, indent=2), encoding="utf-8")
-                action_text = "插入漏句" if candidate["action"] == "insert" else "替换/重修原句"
-                locator = f"{candidate['chunk_index']}" + (f".{candidate['clause_index']}" if candidate.get("clause_index") else "")
+                action_text = "仅无目标编号时插入漏句" if candidate["action"] == "insert" else "替换原音频片段"
+                locator = str(candidate.get("target_locator") or "") or patch_locator_text(
+                    int(candidate["chunk_index"]),
+                    [int(index) for index in candidate.get("clause_indices") or []],
+                    int(candidate["clause_index"]) if candidate.get("clause_index") else None,
+                )
                 message = "\n".join(
                     [
                         "单句试听已生成",
@@ -4267,11 +5209,13 @@ def create_ui(config: AppConfig):
                         f"Text: {target_text}",
                         f"ASR score: {candidate['srt_score']:.2f}, coverage: {candidate['srt_coverage']:.2f}",
                         f"Candidate passed: {passed}",
-                        f"Audio: {audio_path}",
+                        f"Audio: {export_audio}",
+                        f"Source audio: {audio_path}",
+                        f"PR meta: {export_meta}",
                         f"Report: {report_path}",
                     ]
                 )
-                return json.dumps(candidate, ensure_ascii=False), str(audio_path), str(audio_path), message
+                return json.dumps(candidate, ensure_ascii=False), str(export_audio), str(export_audio), message
             except Exception:
                 return "", None, None, traceback.format_exc()
 
@@ -4294,8 +5238,8 @@ def create_ui(config: AppConfig):
 
                 chunk_index = candidate.get("chunk_index")
                 clause_index = candidate.get("clause_index")
-                locator = str(chunk_index or "manual")
-                if clause_index:
+                locator = str(candidate.get("target_locator") or "") or str(chunk_index or "manual")
+                if clause_index and not candidate.get("target_locator"):
                     locator += f".{clause_index}"
                 action = "insert" if candidate.get("action") == "insert" else "replace"
                 target_text = str(candidate.get("target_text") or "").strip()
@@ -4354,27 +5298,96 @@ def create_ui(config: AppConfig):
                     raise FileNotFoundError(f"单句候选音频不存在: {candidate_audio}")
 
                 chunk_chars = int(chunk_chars_value or 70)
-                chunks = split_tts_chunks(text or "", chunk_chars)
-                entries = load_audio_sequence(job, chunks)
-                chunk_index = int(candidate.get("chunk_index") or 0)
-                if chunk_index < 1:
+                sequence_chunks, entries = load_audio_sequence_for_patch(job, text or "", chunk_chars)
+                patch_chunk_index = int(candidate.get("chunk_index") or 0)
+                if patch_chunk_index < 1:
                     raise ValueError("候选状态缺少有效目标分段。")
                 target_text = str(candidate.get("target_text") or "")
                 target_norm = normalize_text(target_text)
                 action = str(candidate.get("action") or "replace")
                 final_patch_audio = candidate_audio
                 replacement_text = target_text
+                source_target_text = str(candidate.get("source_target_text") or target_text)
+                source_target_norm = normalize_text(source_target_text)
+                source_chunk_norm = normalize_text(str(candidate.get("source_chunk") or ""))
+                sequence_chunk_index = patch_chunk_index
+                sequence_chunk_text = sequence_chunks[sequence_chunk_index - 1] if 1 <= sequence_chunk_index <= len(sequence_chunks) else ""
+                indexed_by_locator = any("sentence_index" in entry and "clause_index" in entry for entry in entries)
+                direct_splice_audio: Path | None = None
 
-                if action == "replace" and candidate.get("clause_index"):
+                if indexed_by_locator:
+                    target_units = [
+                        unit
+                        for unit in (candidate.get("target_units") or [])
+                        if isinstance(unit, dict)
+                    ]
+                    target_unit_keys = {
+                        (int(unit.get("sentence_index") or 0), int(unit.get("clause_index") or 0))
+                        for unit in target_units
+                    }
+                    clause_indices = [
+                        int(index)
+                        for index in (candidate.get("clause_indices") or [])
+                        if str(index).strip()
+                    ]
+                    if not clause_indices and candidate.get("clause_index"):
+                        clause_indices = [int(candidate["clause_index"])]
+
+                    target_entry_indexes: list[int] = []
+                    for entry_index, entry in enumerate(entries):
+                        if entry.get("kind") == "insert":
+                            continue
+                        if target_unit_keys:
+                            key = (int(entry.get("sentence_index") or 0), int(entry.get("clause_index") or 0))
+                            if key in target_unit_keys:
+                                target_entry_indexes.append(entry_index)
+                            continue
+                        if int(entry.get("sentence_index") or 0) != patch_chunk_index:
+                            continue
+                        if clause_indices and int(entry.get("clause_index") or 0) not in clause_indices:
+                            continue
+                        target_entry_indexes.append(entry_index)
+
+                    if not target_entry_indexes:
+                        for entry_index, entry in enumerate(entries):
+                            if entry.get("kind") == "insert":
+                                continue
+                            entry_norm = normalize_text(str(entry.get("text") or ""))
+                            if (
+                                (source_target_norm and (source_target_norm in entry_norm or entry_norm in source_target_norm))
+                                or (target_norm and (target_norm in entry_norm or entry_norm in target_norm))
+                            ):
+                                target_entry_indexes.append(entry_index)
+
+                    if target_entry_indexes:
+                        first_target = entries[target_entry_indexes[0]]
+                        sequence_chunk_index = int(first_target.get("chunk_index") or sequence_chunk_index)
+                        sequence_chunk_text = str(first_target.get("text") or sequence_chunk_text)
+                else:
+                    for entry in entries:
+                        if entry.get("kind") == "insert":
+                            continue
+                        entry_text = str(entry.get("text") or "")
+                        entry_norm = normalize_text(entry_text)
+                        if (
+                            (source_target_norm and source_target_norm in entry_norm)
+                            or (source_chunk_norm and source_chunk_norm in entry_norm)
+                        ):
+                            sequence_chunk_index = int(entry.get("chunk_index") or sequence_chunk_index)
+                            sequence_chunk_text = entry_text
+                            break
+
+                replace_clause_indices = find_clause_indices_for_text(sequence_chunk_text, source_target_text)
+                if action == "replace" and replace_clause_indices and not indexed_by_locator:
                     from faster_whisper import WhisperModel  # type: ignore
 
                     asr_model_for_rebuild = WhisperModel(str(config.asr_model), device="cpu", compute_type="int8")
                     final_patch_audio = rebuild_chunk_with_clause_candidate(
                         config,
                         job,
-                        chunks[chunk_index - 1],
-                        chunk_index,
-                        int(candidate["clause_index"]),
+                        sequence_chunk_text,
+                        sequence_chunk_index,
+                        replace_clause_indices,
                         candidate_audio,
                         Path(str(candidate["voice_config"])),
                         asr_model_for_rebuild,
@@ -4383,24 +5396,195 @@ def create_ui(config: AppConfig):
                         float(candidate.get("pass_cer") or 0.14),
                         job / "tts" / "sentence_patch" / "applied",
                     )
-                    replacement_text = chunks[chunk_index - 1]
+                    replacement_text = sequence_chunk_text
 
-                if action == "insert":
+                if indexed_by_locator:
+                    duplicate_key = (patch_chunk_index, target_norm)
                     entries = [
                         entry
                         for entry in entries
                         if not (
                             entry.get("kind") == "insert"
-                            and int(entry.get("chunk_index") or 0) == chunk_index
+                            and int(entry.get("sentence_index") or 0) == duplicate_key[0]
+                            and str(entry.get("target_norm") or "") == duplicate_key[1]
+                        )
+                    ]
+                    if action == "insert":
+                        insert_at = next(
+                            (
+                                index
+                                for index, entry in enumerate(entries)
+                                if int(entry.get("sentence_index") or 0) >= patch_chunk_index
+                            ),
+                            len(entries),
+                        )
+                        entries.insert(
+                            insert_at,
+                            {
+                                "kind": "insert",
+                                "chunk_index": sequence_chunk_index,
+                                "sentence_index": patch_chunk_index,
+                                "clause_index": 0,
+                                "locator": str(candidate.get("target_locator") or "") or patch_locator_text(patch_chunk_index),
+                                "text": target_text,
+                                "target_norm": target_norm,
+                                "audio": str(final_patch_audio),
+                            },
+                        )
+                    else:
+                        clause_indices = [
+                            int(index)
+                            for index in (candidate.get("clause_indices") or [])
+                            if str(index).strip()
+                        ]
+                        if not clause_indices and candidate.get("clause_index"):
+                            clause_indices = [int(candidate["clause_index"])]
+                        target_units = [
+                            unit
+                            for unit in (candidate.get("target_units") or [])
+                            if isinstance(unit, dict)
+                        ]
+                        target_unit_keys = {
+                            (int(unit.get("sentence_index") or 0), int(unit.get("clause_index") or 0))
+                            for unit in target_units
+                        }
+                        if target_unit_keys:
+                            target_entry_indexes = [
+                                index
+                                for index, entry in enumerate(entries)
+                                if entry.get("kind") != "insert"
+                                and (int(entry.get("sentence_index") or 0), int(entry.get("clause_index") or 0)) in target_unit_keys
+                            ]
+                        else:
+                            target_entry_indexes = [
+                                index
+                                for index, entry in enumerate(entries)
+                                if entry.get("kind") != "insert"
+                                and int(entry.get("sentence_index") or 0) == patch_chunk_index
+                                and (not clause_indices or int(entry.get("clause_index") or 0) in clause_indices)
+                            ]
+                        if not target_entry_indexes:
+                            target_entry_indexes = [
+                                index
+                                for index, entry in enumerate(entries)
+                                if entry.get("kind") != "insert"
+                                and source_target_norm
+                                and source_target_norm in normalize_text(str(entry.get("text") or ""))
+                            ]
+                        if not target_entry_indexes:
+                            raise ValueError(
+                                f"替换目标 {str(candidate.get('target_locator') or '') or patch_locator_text(patch_chunk_index, candidate.get('clause_indices') or [], candidate.get('clause_index'))} 没有可剪掉的原音频小段。"
+                                "请先点击“3. 建立修补分段索引”。"
+                            )
+                        target_entries = [entries[index] for index in target_entry_indexes]
+                        timed_target_entries = [
+                            entry
+                            for entry in target_entries
+                            if entry.get("start") is not None and entry.get("end") is not None
+                        ]
+                        current_source = Path(str(audio_value or "")).expanduser()
+                        target_set = set(target_entry_indexes)
+                        first_target_entry = entries[target_entry_indexes[0]]
+
+                        if current_source.exists() and len(timed_target_entries) == len(target_entries):
+                            splice_start = min(float(entry["start"]) for entry in timed_target_entries)
+                            splice_end = max(float(entry["end"]) for entry in timed_target_entries)
+                            previous_entries = [
+                                entry
+                                for index, entry in enumerate(entries[: min(target_entry_indexes)])
+                                if index not in target_set and entry.get("end") is not None
+                            ]
+                            next_entries = [
+                                entry
+                                for index, entry in enumerate(entries[max(target_entry_indexes) + 1 :], start=max(target_entry_indexes) + 1)
+                                if index not in target_set and entry.get("start") is not None
+                            ]
+                            if previous_entries:
+                                splice_start = max(splice_start, float(previous_entries[-1]["end"]))
+                            if next_entries:
+                                splice_end = min(splice_end, float(next_entries[0]["start"]))
+                            if splice_end <= splice_start:
+                                raise ValueError("替换区间被相邻编号保护夹空，请重新建立修补分段索引或改用更大的编号范围。")
+                            direct_splice_audio = splice_audio_replace_range(
+                                config,
+                                current_source,
+                                final_patch_audio,
+                                job / "tts" / "tts_sentence_patch_applied.wav",
+                                splice_start,
+                                splice_end,
+                                job / "logs" / "sentence_patch_direct_splice",
+                            )
+                            original_span = max(0.001, splice_end - splice_start)
+                            patch_duration = audio_duration_seconds(config, final_patch_audio) or original_span
+                            delta = patch_duration - original_span
+                            replacement_entry = {
+                                "kind": "patch",
+                                "chunk_index": int(first_target_entry.get("chunk_index") or sequence_chunk_index),
+                                "sentence_index": patch_chunk_index,
+                                "clause_index": int(first_target_entry.get("clause_index") or 0),
+                                "locator": str(candidate.get("target_locator") or "") or patch_locator_text(patch_chunk_index, clause_indices, candidate.get("clause_index")),
+                                "text": replacement_text,
+                                "target_norm": target_norm,
+                                "source_audio": str(direct_splice_audio),
+                                "start": splice_start,
+                                "end": splice_start + patch_duration,
+                                "audio": str(final_patch_audio),
+                            }
+                            rebuilt_entries: list[dict[str, Any]] = []
+                            inserted_replacement = False
+                            for entry_index, entry in enumerate(entries):
+                                if entry_index in target_set:
+                                    if not inserted_replacement:
+                                        rebuilt_entries.append(replacement_entry)
+                                        inserted_replacement = True
+                                    continue
+                                updated_entry = dict(entry)
+                                if updated_entry.get("start") is not None and updated_entry.get("end") is not None:
+                                    old_start = float(updated_entry["start"])
+                                    old_end = float(updated_entry["end"])
+                                    if old_start >= splice_end:
+                                        updated_entry["start"] = old_start + delta
+                                        updated_entry["end"] = old_end + delta
+                                    updated_entry["source_audio"] = str(direct_splice_audio)
+                                rebuilt_entries.append(updated_entry)
+                            entries = rebuilt_entries
+                        else:
+                            replacement_entry = {
+                                "kind": "patch",
+                                "chunk_index": int(first_target_entry.get("chunk_index") or sequence_chunk_index),
+                                "sentence_index": patch_chunk_index,
+                                "clause_index": int(first_target_entry.get("clause_index") or 0),
+                                "locator": str(candidate.get("target_locator") or "") or patch_locator_text(patch_chunk_index, clause_indices, candidate.get("clause_index")),
+                                "text": replacement_text,
+                                "target_norm": target_norm,
+                                "audio": str(final_patch_audio),
+                            }
+                            rebuilt_entries = []
+                            inserted_replacement = False
+                            for entry_index, entry in enumerate(entries):
+                                if entry_index in target_set:
+                                    if not inserted_replacement:
+                                        rebuilt_entries.append(replacement_entry)
+                                        inserted_replacement = True
+                                    continue
+                                rebuilt_entries.append(entry)
+                            entries = rebuilt_entries
+                elif action == "insert":
+                    entries = [
+                        entry
+                        for entry in entries
+                        if not (
+                            entry.get("kind") == "insert"
+                            and int(entry.get("chunk_index") or 0) == sequence_chunk_index
                             and str(entry.get("target_norm") or "") == target_norm
                         )
                     ]
-                    insert_at = sequence_insert_position(entries, chunk_index)
+                    insert_at = sequence_insert_position(entries, sequence_chunk_index)
                     entries.insert(
                         insert_at,
                         {
                             "kind": "insert",
-                            "chunk_index": chunk_index,
+                            "chunk_index": sequence_chunk_index,
                             "text": target_text,
                             "target_norm": target_norm,
                             "audio": str(final_patch_audio),
@@ -4412,16 +5596,16 @@ def create_ui(config: AppConfig):
                         for entry in entries
                         if not (
                             entry.get("kind") == "insert"
-                            and int(entry.get("chunk_index") or 0) == chunk_index
+                            and int(entry.get("chunk_index") or 0) == sequence_chunk_index
                             and str(entry.get("target_norm") or "") == target_norm
                         )
                     ]
                     replaced = False
                     for entry_index, entry in enumerate(entries):
-                        if int(entry.get("chunk_index") or 0) == chunk_index and entry.get("kind") != "insert":
+                        if int(entry.get("chunk_index") or 0) == sequence_chunk_index and entry.get("kind") != "insert":
                             entries[entry_index] = {
                                 "kind": "patch",
-                                "chunk_index": chunk_index,
+                                "chunk_index": sequence_chunk_index,
                                 "text": replacement_text,
                                 "target_norm": target_norm,
                                 "audio": str(final_patch_audio),
@@ -4430,20 +5614,23 @@ def create_ui(config: AppConfig):
                             break
                     if not replaced:
                         raise ValueError(
-                            f"替换目标 {chunk_index} 没有可剪掉的原音频段。"
+                            f"替换目标 {str(candidate.get('target_locator') or '') or patch_locator_text(patch_chunk_index, candidate.get('clause_indices') or [], candidate.get('clause_index'))} 没有可剪掉的原音频段。"
                             "请先运行 2b 生成完整分段音频映射，或改用漏句插入。"
                         )
 
-                pad_seconds = max(0.0, min(0.8, float(pad_ms_value or 0.0) / 1000.0))
-                ordered_audio = [Path(str(entry["audio"])) for entry in entries]
-                final_audio = concat_audio_with_padding(
-                    config,
-                    ordered_audio,
-                    job / "tts" / "tts_sentence_patch_applied.wav",
-                    pad_seconds,
-                    job / "logs" / "sentence_patch_concat",
-                )
-                save_audio_sequence(job, chunks, entries)
+                if direct_splice_audio is not None:
+                    final_audio = direct_splice_audio
+                else:
+                    pad_seconds = 0.0 if indexed_by_locator else max(0.0, min(0.8, float(pad_ms_value or 0.0) / 1000.0))
+                    ordered_audio = [Path(str(entry["audio"])) for entry in entries]
+                    final_audio = concat_audio_with_padding(
+                        config,
+                        ordered_audio,
+                        job / "tts" / "tts_sentence_patch_applied.wav",
+                        pad_seconds,
+                        job / "logs" / "sentence_patch_concat",
+                    )
+                save_audio_sequence(job, sequence_chunks, entries)
 
                 from faster_whisper import WhisperModel  # type: ignore
 
@@ -4465,7 +5652,7 @@ def create_ui(config: AppConfig):
                             "# Sentence Patch Apply",
                             "",
                             f"- Action: {action}",
-                            f"- Target chunk: {chunk_index}",
+                            f"- Target: {str(candidate.get('target_locator') or '') or patch_locator_text(patch_chunk_index, candidate.get('clause_indices') or [], candidate.get('clause_index'))}",
                             f"- Target text: `{target_text}`",
                             f"- Candidate audio: `{candidate_audio}`",
                             f"- Applied audio: `{final_audio}`",
@@ -4823,31 +6010,14 @@ def create_ui(config: AppConfig):
             outputs=[generated_audio, audio_state, status],
         )
         btn_tts_repair.click(
-            generate_tts_repaired,
+            build_manual_patch_audio_index,
             inputs=[
                 job_state,
-                model,
+                audio_state,
                 source_text,
-                gpt_weights,
-                sovits_weights,
-                reference_preset,
-                ref_audio_file,
-                reference_text,
-                no_ref_text,
-                prompt_lang,
                 text_lang,
-                text_split_method,
-                speed_factor,
-                fragment_interval,
-                top_k,
-                top_p,
-                temperature,
-                auto_chunk_chars,
-                auto_retries,
-                auto_pass_cer,
-                auto_pad_ms,
             ],
-            outputs=[generated_audio, audio_state, srt_state, srt_editor, status],
+            outputs=[generated_audio, audio_state, srt_state, srt_editor, manual_patch_options, status],
         )
         btn_crop.click(
             make_crop,
@@ -4855,21 +6025,10 @@ def create_ui(config: AppConfig):
             outputs=[crop_preview, status],
         )
         btn_asr.click(
-            make_asr,
-            inputs=[job_state, audio_state, source_text, text_lang],
-            outputs=[srt_state, srt_editor, status],
-        )
-        btn_retime_srt.click(
-            retime_srt_from_editor,
-            inputs=[job_state, audio_state, srt_editor, source_text, text_lang],
-            outputs=[srt_state, srt_editor, status],
-            api_name="retime_srt_from_editor",
-        )
-        btn_secondary_review.click(
-            secondary_review,
+            subtitle_retime_and_review,
             inputs=[job_state, audio_state, source_text, srt_editor, text_lang, review_mode, agent_api_url, agent_model, agent_api_key],
-            outputs=[status, srt_state, srt_editor, review_report],
-            api_name="secondary_review",
+            outputs=[srt_state, srt_editor, status, review_report],
+            api_name="subtitle_retime_and_review",
         )
         btn_list_manual_patch.click(
             list_manual_patch_options,
@@ -4877,36 +6036,11 @@ def create_ui(config: AppConfig):
             outputs=[manual_patch_options],
             api_name="list_manual_patch_options",
         )
-        btn_secondary_patch.click(
-            secondary_auto_patch,
-            inputs=[
-                job_state,
-                audio_state,
-                source_text,
-                srt_editor,
-                manual_patch_targets,
-                model,
-                gpt_weights,
-                sovits_weights,
-                reference_preset,
-                ref_audio_file,
-                reference_text,
-                no_ref_text,
-                prompt_lang,
-                text_lang,
-                text_split_method,
-                speed_factor,
-                fragment_interval,
-                top_k,
-                top_p,
-                temperature,
-                auto_chunk_chars,
-                auto_retries,
-                auto_pass_cer,
-                auto_pad_ms,
-            ],
-            outputs=[generated_audio, audio_state, srt_state, srt_editor, review_report, status],
-            api_name="secondary_auto_patch",
+        sentence_patch_target.change(
+            sentence_patch_target_to_text,
+            inputs=[source_text, sentence_patch_target],
+            outputs=[sentence_patch_text, status],
+            api_name="sentence_patch_target_to_text",
         )
         btn_sentence_patch_preview.click(
             generate_sentence_patch_candidate,
@@ -4938,12 +6072,6 @@ def create_ui(config: AppConfig):
             ],
             outputs=[sentence_patch_state, sentence_patch_audio, generated_audio, status],
             api_name="sentence_patch_preview",
-        )
-        btn_sentence_patch_export.click(
-            export_sentence_patch_candidate,
-            inputs=[job_state, sentence_patch_state, sentence_patch_audio],
-            outputs=[sentence_patch_audio, sentence_patch_export_path, status],
-            api_name="sentence_patch_export",
         )
         btn_sentence_patch_apply.click(
             apply_sentence_patch_candidate,

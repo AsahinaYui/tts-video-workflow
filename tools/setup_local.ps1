@@ -61,16 +61,15 @@ if (-not (Test-Path -LiteralPath $VoiceTemplate)) {
     throw "Missing voice template: $VoiceTemplate"
 }
 
-$RepoParent = Split-Path -Parent $RepoRoot
 $DefaultGptSoVitsRoot = if ($env:GPTSOVITS_ROOT) {
     $env:GPTSOVITS_ROOT
 } else {
-    Join-Path $RepoParent "GPT-SoVITS-v2pro-20250604"
+    Join-Path $RepoRoot "tools\gptsovits"
 }
 $DefaultAsrModel = if ($env:FASTER_WHISPER_MODEL) {
     $env:FASTER_WHISPER_MODEL
 } else {
-    Join-Path $RepoParent "faster-whisper-small"
+    Join-Path $RepoRoot "tools\asr\models\faster-whisper-small"
 }
 
 if ([string]::IsNullOrWhiteSpace($GptSoVitsRoot)) {
@@ -142,8 +141,21 @@ $voice = Get-Content -LiteralPath $VoiceTemplate -Raw -Encoding UTF8 | ConvertFr
 Set-JsonProperty $voice "gptsovits_root" $gsv
 Set-JsonProperty $voice "python_exe" (To-JsonPath $PythonExe)
 Set-JsonProperty $voice "tts_config_path" "skills/gptsovits-tts/config/tts_infer_v2pro.yaml"
-Set-JsonProperty $voice "gpt_weights_path" "$gsv/GPT_weights_v2Pro/your_model.ckpt"
-Set-JsonProperty $voice "sovits_weights_path" "$gsv/SoVITS_weights_v2Pro/your_model.pth"
+Set-JsonProperty $voice "gpt_weights_path" "__use_pretrained_base__"
+Set-JsonProperty $voice "sovits_weights_path" "__use_pretrained_base__"
+if (-not $voice.voice) {
+    Set-JsonProperty $voice "voice" ([pscustomobject]@{})
+}
+Set-JsonProperty $voice.voice "ref_audio_path" ""
+Set-JsonProperty $voice.voice "ref_text_path" ""
+if ($voice.model_switch) {
+    Set-JsonProperty $voice.model_switch "use_pretrained_base" $true
+} else {
+    Set-JsonProperty $voice "model_switch" ([pscustomobject]@{
+        default_version = "v2"
+        use_pretrained_base = $true
+    })
+}
 $voice | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $LocalVoiceConfig -Encoding UTF8
 
 Write-Host "Generated local config:"

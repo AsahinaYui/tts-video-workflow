@@ -10,7 +10,8 @@
 - 从 `config.json` 选择 GPT-SoVITS 推理模型
 - 生成 GPT-SoVITS 旁白并试听
 - 生成 9:16 裁切预览，调节裁切锚点
-- 用 Faster-Whisper 生成字幕草稿
+- 建立手动修补分段索引，按编号替换局部音频
+- 用 Faster-Whisper 生成/重排字幕并审核
 - 在页面里校对/编辑 SRT
 - 调用现有 `make_single_image_video.py` 渲染 MP4 并预览
 - 按 B站预设生成发布包、标题/简介/标签草稿和 16:9 封面预览
@@ -65,7 +66,16 @@ server_stderr.txt
 
 ## 模型配置
 
-新增模型时，在 `config.json` 的 `models` 数组里添加一项。每个模型可以复用同一个 `base_config`，再覆盖：
+默认示例配置使用 GPT-SoVITS 底模推理：
+
+- `gpt_weights_path`: `__use_pretrained_base__`
+- `sovits_weights_path`: `__use_pretrained_base__`
+- `reference_assets`: 空数组
+- 参考音频和参考文本默认留空
+
+实际生成时需要在页面上传参考音频/文本，或在本机 `config.json` 保存自己的参考预设。
+
+新增自训练模型时，在 `config.json` 的 `models` 数组里添加一项。每个模型可以复用同一个 `base_config`，再覆盖：
 
 - `gpt_weights_path`
 - `sovits_weights_path`
@@ -96,32 +106,22 @@ video-webui/jobs/
 - `render/*/preview.mp4`
 - `logs/*.txt`
 
-## 长文本 TTS 自动修复
+## 推荐流程
 
-长文本建议优先使用页面里的 `2b. 分段 TTS 自动修复`，不要直接用普通 `2. 生成 TTS`。
+页面顶部主流程按 `1-6` 排列：
 
-这个流程不调用 Agent，也不消耗 token。它会：
+1. `准备任务`
+2. `生成 TTS`
+3. `建立修补分段索引`
+4. `生成裁切预览`
+5. `字幕生成/重排/审核`
+6. `渲染视频`
 
-- 按句子把长文切成较短片段
-- 每段单独调用 GPT-SoVITS 生成音频
-- 用 Faster-Whisper 本地回听每段音频
-- 用 CER 和长度比例判断是否漏句、掐头、去尾
-- 失败片段自动重试
-- 每段首尾补一点静音后拼接成完整旁白
-- 自动生成一份 SRT 和一份修复报告
+建议先用 `生成 TTS` 生成整段旁白并人工试听。若只发现一两处问题，点击 `建立修补分段索引`，再在 `单句补漏 / 替换试听` 里输入编号，例如 `3.2`、`3.2,4.1` 或整句编号 `3`。
 
-推荐默认参数：
+手动填写编号时，修补语义是 **替换**：程序会裁掉原音频中对应编号的时间区间，再放入新生成的修补音频。跨句边界不自然时，优先选择连续编号一起替换，例如 `3.2,4.1`。
 
-- `自动修复分段字数`: 60-80
-- `失败片段重试次数`: 2
-- `ASR 通过 CER`: 0.12-0.16
-- `片段首尾静音 ms`: 120-200
-
-输出文件通常在当前 job 目录下：
-
-- `tts/tts_segmented_auto_repaired.wav`
-- `asr/subtitles.segmented_auto.srt`
-- `checks/tts_segmented_auto_repair.md`
+索引建立会记录每个编号的时间轴和对齐置信度。若某段置信度很低，建议扩大替换范围到连续小段或整句。
 
 ## 推理面板
 
@@ -147,12 +147,12 @@ video-webui/jobs/
 - `reference_assets`
 - `models`
 
-## 二次审核
+## 字幕审核
 
-页面里的 `6. 二次审核` 会先做本地规则审核：
+页面里的 `字幕生成/重排/审核` 会先做本地规则审核：
 
-- 如果已有 SRT，直接审核 SRT 和原文
-- 如果没有 SRT 但已有音频，会先用 Faster-Whisper 生成 SRT
+- 如果已有 SRT，按编辑器内容重排时间轴并审核
+- 如果没有 SRT 但已有音频，会先用 Faster-Whisper 生成 SRT，再审核
 - 输出 `checks/tts_secondary_review.md`
 - 标记 `PASS / REVIEW / FAIL`
 - 定位缺失片段、弱匹配片段、疑似掐头去尾

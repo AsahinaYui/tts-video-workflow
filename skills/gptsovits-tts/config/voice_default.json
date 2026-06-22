@@ -2,8 +2,8 @@
   "gptsovits_root": "__GPTSOVITS_ROOT__",
   "python_exe": "__GPTSOVITS_ROOT__/runtime/python.exe",
   "tts_config_path": "skills/gptsovits-tts/config/tts_infer_v2pro.yaml",
-  "gpt_weights_path": "__GPTSOVITS_ROOT__/GPT_weights_v2Pro/your_model.ckpt",
-  "sovits_weights_path": "__GPTSOVITS_ROOT__/SoVITS_weights_v2Pro/your_model.pth",
+  "gpt_weights_path": "__use_pretrained_base__",
+  "sovits_weights_path": "__use_pretrained_base__",
   "model_storage": {
     "gpt_weights_dir": "models/gpt_weights",
     "sovits_weights_dir": "models/sovits_weights"
@@ -15,11 +15,12 @@
     "request_timeout_seconds": 900
   },
   "model_switch": {
-    "default_version": "v2"
+    "default_version": "v2",
+    "use_pretrained_base": true
   },
   "voice": {
-    "ref_audio_path": "reference/your_reference.wav",
-    "ref_text_path": "reference/your_reference.txt",
+    "ref_audio_path": "",
+    "ref_text_path": "",
     "ref_text_encoding": "utf-8-sig",
     "prompt_lang": "zh",
     "text_lang": "zh"
