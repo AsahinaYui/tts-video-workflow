@@ -1,101 +1,107 @@
 # Mutsumi TTS Video Workflow
 
-本仓库是本地单图口播视频工作流的代码整理版，包含：
+[English](README.md) | [中文](README.zh-CN.md)
 
-- `video-webui/`：Gradio 本地视频制作 WebUI。
-- `skills/gptsovits-tts/`：GPT-SoVITS TTS 调用、参数切换、音频校验和后处理脚本。
-- `skills/single-image-tts-video/`：单图生成竖屏视频、字幕和 Premiere 辅助文件。
+A local single-image narration video workflow built around GPT-SoVITS, Faster-Whisper, FFmpeg, and a Gradio WebUI.
 
-仓库不包含模型权重、参考音频、生成音视频或本地任务产物。
+This repository contains:
 
-示例配置默认使用 GPT-SoVITS 底模推理，参考音频/参考文本留空；实际生成时请在 WebUI 上传参考音频/文本，或只在本机 `config.json` 中保存自己的参考预设。
+- `video-webui/`: the local Gradio video production WebUI.
+- `skills/gptsovits-tts/`: GPT-SoVITS TTS invocation, model switching, audio checking, and post-processing scripts.
+- `skills/single-image-tts-video/`: single-image vertical video rendering, subtitle generation, and Premiere helper output.
 
-## 运行方式
+The repository does not include model weights, reference audio, generated audio/video files, or local job outputs.
 
-这是一个本地部署工作流，不依赖在线 Agent，也不会主动联网调用 LLM。
+The example configuration defaults to GPT-SoVITS base-model inference. Reference audio and reference text are blank by default. For real generation, upload reference audio/text in the WebUI or save your own local presets in `config.json`.
 
-运行时会在本机调用：
+## Runtime Model
 
-- 本地 GPT-SoVITS API / runtime
-- 本地 Faster-Whisper 模型
-- 本地 FFmpeg / FFprobe
-- 本地 Gradio WebUI
+This is a local deployment workflow. It does not depend on an online Agent and does not call any LLM service by default.
 
-## 本地依赖
+At runtime it uses local tools:
 
-需要自行准备，并在本地配置中填写真实路径：
+- local GPT-SoVITS API / runtime
+- local Faster-Whisper model
+- local FFmpeg / FFprobe
+- local Gradio WebUI
 
-- GPT-SoVITS v2/v2Pro 本地项目
-- GPT-SoVITS runtime Python、FFmpeg、FFprobe
-- Faster-Whisper 模型
-- 参考音频和对应参考文本
-- 可选的自训练 GPT weights / SoVITS weights
+## Local Dependencies
 
-## 一键本地配置
+Prepare these locally and point the configuration to their real paths:
 
-Windows 用户可以先运行：
+- a local GPT-SoVITS v2/v2Pro project
+- GPT-SoVITS runtime Python, FFmpeg, and FFprobe
+- a Faster-Whisper model directory
+- reference audio and matching reference text
+- optional custom GPT weights / SoVITS weights
+
+## One-Step Local Setup
+
+On Windows, run:
 
 ```powershell
 cd <repo>
 .\setup_windows.bat
 ```
 
-它会引导填写：
+The setup script asks for:
 
-- GPT-SoVITS 根目录
-- Faster-Whisper 模型目录
+- GPT-SoVITS root directory
+- Faster-Whisper model directory
 
-然后自动生成：
+Then it generates:
 
 - `video-webui/config.json`
 - `local/voice_default.local.json`
 
-生成后会立即运行环境检测。
+After generation, it immediately runs the local environment check.
 
-默认不会下载 GPT-SoVITS、模型或其他大文件。如果需要顺便安装 Python 包，可以运行：
+By default, setup does not download GPT-SoVITS, models, or other large files. To also install Python packages, run:
 
 ```powershell
 cd <repo>
 powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\setup_local.ps1 -InstallPythonPackages
 ```
 
-`-InstallPythonPackages` 会调用 pip，可能需要联网。
+`-InstallPythonPackages` uses `pip` and may require network access.
 
-## 启动
+## Launch
 
-如果不使用 `setup_windows.bat`，也可以手动复制示例配置：
+If you do not use `setup_windows.bat`, you can create the config manually:
 
 ```powershell
 cd <repo>\video-webui
 Copy-Item .\config.example.json .\config.json
 ```
 
-然后按本机路径编辑 `video-webui/config.json`。
+Then edit `video-webui/config.json` for your local paths.
 
-启动前建议先检查本机依赖：
+Before launching, you can check local dependencies:
 
 ```powershell
 cd <repo>
 python .\tools\check_environment.py
 ```
 
-也可以双击：
+Or double-click:
 
 ```text
 check_environment.bat
 ```
 
-检查脚本只读取本地路径并测试本机工具，不下载模型、不联网。
+The environment checker only reads local paths and tests local tools. It does not download models or access the network.
 
-启动 WebUI：
+Start the WebUI:
 
 ```powershell
 cd <repo>\video-webui
 .\start_webui.ps1
 ```
 
-默认地址：
+Default URL:
 
 ```text
 http://127.0.0.1:7860
 ```
+
+After the browser page is closed, the WebUI process exits automatically after a short heartbeat timeout.
