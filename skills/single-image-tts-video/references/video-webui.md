@@ -17,7 +17,6 @@ Important files:
 - `config.example.json`
 - `README.md`
 - `start_webui.ps1`
-- `stop_webui.ps1`
 - `run.ps1`
 - `jobs/`
 
@@ -54,12 +53,7 @@ Open:
 http://127.0.0.1:7860
 ```
 
-Stop:
-
-```powershell
-cd <repo>\video-webui
-.\stop_webui.ps1
-```
+Close the browser page to let the WebUI process exit automatically after its heartbeat timeout.
 
 ## WebUI Features
 

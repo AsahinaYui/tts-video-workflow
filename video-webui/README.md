@@ -1,6 +1,6 @@
 # Local Video WebUI
 
-本地单图口播视频流水线，目标是把之前靠 Codex Agent 串起来的流程固化成可重复运行的本地 WebUI。
+本地单图口播视频流水线，目标是把 TTS、字幕、裁切和渲染流程固化成可重复运行的本地 WebUI。
 
 如果要迁移或交接，先读仓库根目录 `README.md`，并确认本机 `config.json` 已经指向正确的 GPT-SoVITS、Faster-Whisper 和 FFmpeg 路径。
 
@@ -14,7 +14,6 @@
 - 用 Faster-Whisper 生成/重排字幕并审核
 - 在页面里校对/编辑 SRT
 - 调用现有 `make_single_image_video.py` 渲染 MP4 并预览
-- 按 B站预设生成发布包、标题/简介/标签草稿和 16:9 封面预览
 - 每个任务保存输入、日志、SRT、QA、视频输出
 
 ## 启动
@@ -26,12 +25,7 @@ cd <repo>\video-webui
 .\start_webui.ps1
 ```
 
-停止后台服务：
-
-```powershell
-cd <repo>\video-webui
-.\stop_webui.ps1
-```
+脚本会自动打开浏览器。浏览器页面关闭后，WebUI 会在短暂心跳超时后自动结束后台服务。
 
 前台启动（方便实时看日志）：
 

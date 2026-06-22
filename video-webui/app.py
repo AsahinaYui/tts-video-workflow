@@ -10,6 +10,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import traceback
 import unicodedata
@@ -60,6 +61,11 @@ TEXT_SPLIT_OPTIONS = [
 AUDIO_EXTENSIONS = {".wav", ".mp3", ".flac", ".ogg", ".aac", ".m4a"}
 BASE_MODEL_VALUE = "__use_pretrained_base__"
 BASE_MODEL_LABEL = "不使用模型（底模推理）"
+BROWSER_HEARTBEAT_INTERVAL_SECONDS = 5.0
+BROWSER_HEARTBEAT_TIMEOUT_SECONDS = 30.0
+BROWSER_HEARTBEAT_LOCK = threading.Lock()
+BROWSER_HEARTBEAT_LAST = 0.0
+BROWSER_HEARTBEAT_WATCHDOG_STARTED = False
 APP_CSS = """
 #video-webui .gradio-container {
     max-width: 1680px !important;
@@ -165,6 +171,28 @@ def patch_gradio_local_url_check() -> None:
     boot_log("patched gradio localhost url_ok check")
 
 
+def browser_heartbeat_watchdog() -> None:
+    boot_log("browser heartbeat watchdog started")
+    while True:
+        time.sleep(BROWSER_HEARTBEAT_INTERVAL_SECONDS)
+        with BROWSER_HEARTBEAT_LOCK:
+            last_seen = BROWSER_HEARTBEAT_LAST
+        if last_seen and time.monotonic() - last_seen > BROWSER_HEARTBEAT_TIMEOUT_SECONDS:
+            boot_log("browser heartbeat timed out; exiting WebUI process")
+            os._exit(0)
+
+
+def note_browser_heartbeat() -> str:
+    global BROWSER_HEARTBEAT_LAST, BROWSER_HEARTBEAT_WATCHDOG_STARTED
+    with BROWSER_HEARTBEAT_LOCK:
+        BROWSER_HEARTBEAT_LAST = time.monotonic()
+        if not BROWSER_HEARTBEAT_WATCHDOG_STARTED:
+            BROWSER_HEARTBEAT_WATCHDOG_STARTED = True
+            thread = threading.Thread(target=browser_heartbeat_watchdog, daemon=True)
+            thread.start()
+    return ""
+
+
 @dataclass(frozen=True)
 class AppConfig:
     path: Path
@@ -204,13 +232,6 @@ class AppConfig:
     @property
     def video_script(self) -> Path:
         return resolve_path(str(self.raw["video_script"]), self.path.parent)
-
-    @property
-    def publisher_script(self) -> Path:
-        raw = self.raw.get("publisher_script")
-        if raw:
-            return resolve_path(str(raw), self.path.parent)
-        return (self.project_root / "skills" / "video-platform-publisher" / "scripts" / "prepare_publish_package.py").resolve()
 
     @property
     def ffmpeg(self) -> Path:
@@ -451,7 +472,6 @@ def require_paths(config: AppConfig) -> list[str]:
         "gsv_tts_script": config.gsv_tts_script,
         "tts_checker_script": config.tts_checker_script,
         "video_script": config.video_script,
-        "publisher_script": config.publisher_script,
         "ffmpeg": config.ffmpeg,
         "ffprobe": config.ffprobe,
         "asr_model": config.asr_model,
@@ -3649,6 +3669,8 @@ def create_ui(config: AppConfig):
     startup_note = "路径检查通过" if not missing else "路径缺失:\n" + "\n".join(missing)
 
     with gr.Blocks(title="Local TTS Video Studio", css=APP_CSS, elem_id="video-webui") as demo:
+        browser_heartbeat_state = gr.Textbox(value="", visible=False)
+        browser_heartbeat_timer = gr.Timer(value=BROWSER_HEARTBEAT_INTERVAL_SECONDS, active=True)
         with gr.Row(elem_classes=["app-header"]):
             gr.Markdown("# Local TTS Video Studio")
 
@@ -3825,37 +3847,7 @@ def create_ui(config: AppConfig):
                     sentence_top_p = gr.Slider(0.0, 1.0, value=default_top_p, step=0.05, label="单句 top_p")
                     sentence_temperature = gr.Slider(0.1, 2.0, value=default_temperature, step=0.05, label="单句 temperature")
                     sentence_patch_audio = gr.Audio(label="单句试听", type="filepath")
-            with gr.Accordion("发布准备", open=True):
-                with gr.Row(elem_classes=["dense-row"]):
-                    publish_platform = gr.Dropdown(
-                        choices=[("B站", "bilibili")],
-                        value="bilibili",
-                        label="平台预设",
-                        scale=1,
-                    )
-                    publish_video_path = gr.Textbox(
-                        label="成品 MP4 路径（可选）",
-                        placeholder="留空则使用刚渲染的视频，或自动查找当前任务最新 MP4",
-                        scale=3,
-                    )
-                    btn_prepare_publish = gr.Button("生成发布包", scale=1)
-                with gr.Row(elem_classes=["dense-row"]):
-                    publish_title = gr.Textbox(
-                        label="标题（可选）",
-                        placeholder="留空则按 B站预设使用文案第一句",
-                        scale=2,
-                    )
-                    publish_scheduled_time = gr.Textbox(
-                        label="定时发布（可选）",
-                        placeholder="例如 2026-06-22 20:30；留空则立即发布",
-                        scale=1,
-                    )
-                with gr.Row(elem_classes=["dense-row"]):
-                    publish_cover_x = gr.Slider(0.0, 1.0, value=0.5, step=0.01, label="封面裁切 X")
-                    publish_cover_y = gr.Slider(0.0, 1.0, value=0.5, step=0.01, label="封面裁切 Y")
-                publish_cover_preview = gr.Image(label="B站 16:9 封面预览", type="filepath", elem_classes=["preview-media"])
-                publish_package_dir = gr.Textbox(label="发布包目录")
-                publish_draft = gr.Textbox(label="发布草稿", lines=12, elem_classes=["srt-editor"])
+            rendered_video_path = gr.Textbox(value="", visible=False)
             output_dir = gr.Textbox(label="当前任务目录")
 
         def on_model_preset_change(label: str):
@@ -5763,125 +5755,6 @@ def create_ui(config: AppConfig):
             except Exception:
                 return None, "", "", traceback.format_exc()
 
-        def latest_job_video(job: Path) -> Path | None:
-            candidates = sorted(
-                [path for path in (job / "render").glob("**/*.mp4") if path.is_file()],
-                key=lambda path: path.stat().st_mtime,
-                reverse=True,
-            )
-            return candidates[0].resolve() if candidates else None
-
-        def prepare_publish_package_ui(
-            job_value: str,
-            video_value: str,
-            manual_video_value: str,
-            image_value: str,
-            text: str,
-            platform_value: str,
-            title_value: str,
-            scheduled_time_value: str,
-            cover_x_value: float,
-            cover_y_value: float,
-        ):
-            try:
-                if not job_value:
-                    raise ValueError("请先点击“准备任务”。")
-                job = Path(job_value)
-                platform = platform_value or "bilibili"
-                if platform != "bilibili":
-                    raise ValueError(f"当前 WebUI 发布预设只接入了 B站: {platform}")
-
-                video_path: Path | None = None
-                for value in (manual_video_value, video_value):
-                    if value and str(value).strip():
-                        candidate = Path(str(value).strip()).expanduser()
-                        if candidate.exists():
-                            video_path = candidate.resolve()
-                            break
-                if video_path is None:
-                    video_path = latest_job_video(job)
-                if video_path is None or not video_path.exists():
-                    raise FileNotFoundError("没有找到成品 MP4。请先渲染视频，或手动填写成品 MP4 路径。")
-
-                image_path = Path(str(image_value or "")).expanduser()
-                if not image_path.exists():
-                    raise FileNotFoundError("B站封面需要原始上传图片，请先在当前任务中上传图片。")
-
-                text_path = write_text(job / "input" / "source.txt", text or "")
-                if not (text or "").strip():
-                    raise ValueError("旁白文案为空，无法按 B站预设生成标题/简介。")
-                if not config.publisher_script.exists():
-                    raise FileNotFoundError(f"发布包脚本不存在: {config.publisher_script}")
-
-                package_name = f"bilibili_{now_slug()}"
-                output_base = job / "publish"
-                command = [
-                    str(config.python_exe),
-                    str(config.publisher_script),
-                    "--video",
-                    str(video_path),
-                    "--platform",
-                    "bilibili",
-                    "--text-file",
-                    str(text_path),
-                    "--original-image",
-                    str(image_path),
-                    "--output-dir",
-                    str(output_base),
-                    "--name",
-                    package_name,
-                    "--ffmpeg",
-                    str(config.ffmpeg),
-                    "--ffprobe",
-                    str(config.ffprobe),
-                    "--cover-crop-x",
-                    str(cover_x_value),
-                    "--cover-crop-y",
-                    str(cover_y_value),
-                ]
-                if (title_value or "").strip():
-                    command.extend(["--title", str(title_value).strip()])
-                if (scheduled_time_value or "").strip():
-                    command.extend(["--scheduled-time", str(scheduled_time_value).strip()])
-
-                result = run_command(command, config.project_root, job / "logs" / "publish_bilibili.txt")
-                if result.returncode != 0:
-                    raise RuntimeError(result.stderr[-3000:] or result.stdout[-3000:])
-                manifest = parse_json_from_stdout(result.stdout)
-                package_dir = Path(str(manifest.get("package_dir") or output_base / package_name))
-                platform_info = (manifest.get("platforms") or {}).get("bilibili", {})
-                cover_candidates = platform_info.get("cover_candidates") or []
-                cover_path = ""
-                if cover_candidates:
-                    cover_path = str(cover_candidates[0].get("path") or "")
-                if not cover_path:
-                    cover_path = str(platform_info.get("cover") or "")
-                draft_path = Path(str(platform_info.get("draft") or package_dir / "bilibili" / "publish_draft.md"))
-                draft_text = draft_path.read_text(encoding="utf-8-sig") if draft_path.exists() else ""
-                metadata_path = Path(str(platform_info.get("metadata") or package_dir / "bilibili" / "metadata.json"))
-                metadata: dict[str, Any] = {}
-                if metadata_path.exists():
-                    metadata = json.loads(metadata_path.read_text(encoding="utf-8-sig"))
-                title = str(metadata.get("title") or "")
-                tags = ", ".join(metadata.get("tags") or [])
-                timing = metadata.get("publish_timing") or {}
-                timing_text = timing.get("scheduled_time") or timing.get("mode") or "immediate"
-                message = "\n".join(
-                    [
-                        "B站发布包已生成",
-                        f"Package: {package_dir}",
-                        f"Video: {video_path}",
-                        f"Cover 16:9: {cover_path}",
-                        f"Title: {title}",
-                        f"Tags: {tags}",
-                        f"Timing: {timing_text}",
-                        "发布动作仍需手动到 B站页面完成；最终发布前需要你确认。",
-                    ]
-                )
-                return cover_path or None, str(package_dir), draft_text, message
-            except Exception:
-                return None, "", "", traceback.format_exc()
-
         btn_prepare.click(
             prepare_job,
             inputs=[job_name, image_file, uploaded_audio, uploaded_srt, source_text],
@@ -5895,7 +5768,7 @@ def create_ui(config: AppConfig):
                 generated_audio,
                 srt_editor,
                 status,
-                publish_video_path,
+                rendered_video_path,
                 output_dir,
             ],
         )
@@ -6091,24 +5964,18 @@ def create_ui(config: AppConfig):
         btn_render.click(
             render_video,
             inputs=[job_state, image_state, audio_state, bgm_file, source_text, srt_editor, crop_x, crop_y, bgm_volume, bgm_start],
-            outputs=[video_preview, video_state, publish_video_path, status],
+            outputs=[video_preview, video_state, rendered_video_path, status],
         )
-        btn_prepare_publish.click(
-            prepare_publish_package_ui,
-            inputs=[
-                job_state,
-                video_state,
-                publish_video_path,
-                image_state,
-                source_text,
-                publish_platform,
-                publish_title,
-                publish_scheduled_time,
-                publish_cover_x,
-                publish_cover_y,
-            ],
-            outputs=[publish_cover_preview, publish_package_dir, publish_draft, status],
-            api_name="prepare_publish_package",
+        demo.load(
+            note_browser_heartbeat,
+            outputs=[browser_heartbeat_state],
+            queue=False,
+        )
+        browser_heartbeat_timer.tick(
+            note_browser_heartbeat,
+            outputs=[browser_heartbeat_state],
+            queue=False,
+            show_progress="hidden",
         )
 
     return demo

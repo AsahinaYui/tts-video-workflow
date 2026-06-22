@@ -5,15 +5,14 @@
 - `video-webui/`：Gradio 本地视频制作 WebUI。
 - `skills/gptsovits-tts/`：GPT-SoVITS TTS 调用、参数切换、音频校验和后处理脚本。
 - `skills/single-image-tts-video/`：单图生成竖屏视频、字幕和 Premiere 辅助文件。
-- `skills/video-platform-publisher/`：发布前素材打包和平台预设说明。
 
-仓库不包含模型权重、参考音频、生成音视频、平台账号信息或本地任务产物。
+仓库不包含模型权重、参考音频、生成音视频或本地任务产物。
 
 示例配置默认使用 GPT-SoVITS 底模推理，参考音频/参考文本留空；实际生成时请在 WebUI 上传参考音频/文本，或只在本机 `config.json` 中保存自己的参考预设。
 
 ## 运行方式
 
-这是一个本地部署工作流，不依赖 Codex Agent，也不会主动联网调用 LLM。
+这是一个本地部署工作流，不依赖在线 Agent，也不会主动联网调用 LLM。
 
 运行时会在本机调用：
 
@@ -21,8 +20,6 @@
 - 本地 Faster-Whisper 模型
 - 本地 FFmpeg / FFprobe
 - 本地 Gradio WebUI
-
-如果配置了平台发布自动化，登录和上传动作另算，需要用户在浏览器中授权确认。
 
 ## 本地依赖
 
@@ -102,16 +99,3 @@ cd <repo>\video-webui
 ```text
 http://127.0.0.1:7860
 ```
-
-## GitHub 上传建议
-
-建议先作为 Private 仓库发布。发布前确认 GitHub Desktop 的 Changes 列表里没有：
-
-- `jobs/`
-- `temp/`
-- `reference/`
-- `.wav` / `.mp4` / `.srt`
-- `.ckpt` / `.pth` / `model.bin`
-- `config.json`
-
-如果以后要公开仓库，需要再次检查图片、音频、模型权重和第三方项目 License。
