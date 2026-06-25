@@ -151,6 +151,8 @@ video-webui/jobs/
 - 标记 `PASS / REVIEW / FAIL`
 - 定位缺失片段、弱匹配片段、疑似掐头去尾
 
+只要提供了旁白原文，最终显示字幕的文字以原文为准。Faster-Whisper 的识别结果只用于时间轴估计和音频质检，并会另存为 `*.raw_asr.srt`。如果编辑器里残留 ASR 错字，重新运行 `字幕生成/重排/审核` 会按原文重建字幕文本；直接渲染时也会自动用原文字幕，避免把 ASR 错字烧进视频。
+
 也可以选择 `本地 + Chat API`，通过 OpenAI-compatible Chat Completions 接口做语义复核。这个接口只使用 `/chat/completions`，不使用 Responses API。
 
 可填写：

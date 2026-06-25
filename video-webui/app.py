@@ -1093,6 +1093,23 @@ def parse_srt_blocks(srt_text: str) -> list[dict[str, str]]:
     return blocks
 
 
+def srt_segments_from_text(srt_text: str) -> list[dict[str, Any]]:
+    segments: list[dict[str, Any]] = []
+    for fallback_index, block in enumerate(parse_srt_blocks(srt_text), start=1):
+        match = re.match(
+            r"\s*(\d+:\d+:\d+,\d+)\s*-->\s*(\d+:\d+:\d+,\d+)",
+            str(block.get("time") or ""),
+        )
+        if not match:
+            continue
+        start = parse_srt_timestamp(match.group(1))
+        end = parse_srt_timestamp(match.group(2))
+        text = str(block.get("text") or "").strip()
+        if text and end > start:
+            segments.append({"index": fallback_index, "start": start, "end": end, "text": text})
+    return segments
+
+
 def split_review_chunks(text: str) -> list[str]:
     return split_tts_chunks(text, 90)
 
@@ -1855,6 +1872,42 @@ def editor_subtitle_blocks(config: AppConfig, editor_text: str) -> list[str]:
 
 def subtitle_blocks_to_plain_text(blocks: list[str]) -> str:
     return "".join(block.replace("\n", "") for block in blocks)
+
+
+def subtitle_text_matches_source(source_text: str, blocks: list[str]) -> bool:
+    if not (source_text or "").strip() or not blocks:
+        return False
+    return normalize_text(source_text) == normalize_text(subtitle_blocks_to_plain_text(blocks))
+
+
+def final_subtitle_blocks_from_source_or_editor(
+    config: AppConfig,
+    source_text: str,
+    editor_text: str,
+) -> tuple[list[str], str]:
+    source = (source_text or "").strip()
+    editor_blocks = editor_subtitle_blocks(config, editor_text)
+    if not source:
+        return editor_blocks, "editor"
+
+    if subtitle_text_matches_source(source, editor_blocks):
+        return editor_blocks, "editor_line_breaks"
+
+    source_blocks = subtitle_blocks_from_script(config, source)
+    return source_blocks, "source_text"
+
+
+def srt_from_final_subtitle_text(
+    config: AppConfig,
+    audio_path: Path,
+    source_text: str,
+    editor_text: str,
+    segments: list[dict[str, Any]],
+) -> tuple[str, str]:
+    blocks, source_mode = final_subtitle_blocks_from_source_or_editor(config, source_text, editor_text)
+    if not blocks:
+        return "", source_mode
+    return script_aligned_srt_from_blocks(config, audio_path, segments, blocks), source_mode
 
 
 def editor_subtitle_pages_preserve_lines(editor_text: str) -> list[str]:
@@ -3630,7 +3683,7 @@ def render_srt_from_editor(config: AppConfig, audio_path: Path, editor_text: str
     pages = editor_subtitle_pages_preserve_lines(text)
     if not pages:
         return ""
-    duration = wav_duration_seconds(audio_path) or float(len(pages))
+    duration = audio_duration_seconds(config, audio_path) or float(len(pages))
     duration = max(0.1, duration)
     blocks: list[str] = []
     for index, page in enumerate(pages, start=1):
@@ -4477,7 +4530,7 @@ def create_ui(config: AppConfig):
                     raise ValueError("请先点击“准备任务”。")
                 if not audio_value:
                     raise ValueError("请先生成或上传旁白音频。")
-                blocks = editor_subtitle_blocks(config, srt_text)
+                blocks, subtitle_source_mode = final_subtitle_blocks_from_source_or_editor(config, text or "", srt_text)
                 if not blocks:
                     raise ValueError("SRT 校对编辑器为空，或没有可识别的字幕文本。")
                 job = Path(job_value)
@@ -4494,6 +4547,8 @@ def create_ui(config: AppConfig):
 
                 editor_plain = subtitle_blocks_to_plain_text(blocks)
                 report = triad_report(editor_plain, retimed_srt, raw_srt_text, True)
+                if subtitle_source_mode == "source_text":
+                    report = "字幕文字已按旁白原文重建；ASR 只用于时间轴和审核。\n\n" + report
                 if text and normalize_text(text) != normalize_text(editor_plain):
                     report += "\n\nEditor subtitle vs original script:\n" + local_srt_report(text, retimed_srt)
                 return str(srt_path), format_srt_for_editor(config, retimed_srt), report + f"\nSRT: {srt_path}\nRaw ASR SRT: {raw_srt_path}"
@@ -4583,21 +4638,29 @@ def create_ui(config: AppConfig):
                     from faster_whisper import WhisperModel  # type: ignore
 
                     asr_model = WhisperModel(str(config.asr_model), device="cpu", compute_type="int8")
-                    generated_srt, review_srt, _aligned_to_script = subtitle_srt_from_model(
-                        config,
-                        Path(audio_value),
-                        asr_model,
-                        asr_language(text_lang_value),
-                        text or "",
-                    )
-                    if not current_srt.strip():
-                        current_srt = generated_srt
+                    audio_path = Path(audio_value)
+                    segments = transcribe_model_to_segments(audio_path, asr_model, asr_language(text_lang_value))
+                    review_srt = segments_to_srt(segments)
+                    if (text or "").strip():
+                        current_srt, subtitle_source_mode = srt_from_final_subtitle_text(
+                            config,
+                            audio_path,
+                            text or "",
+                            current_srt,
+                            segments,
+                        )
+                    elif not current_srt.strip():
+                        current_srt = review_srt
+                        subtitle_source_mode = "raw_asr"
+                    else:
+                        subtitle_source_mode = "editor"
                     srt_path = write_text(job / "asr" / "subtitles.secondary_review.srt", current_srt)
                     raw_srt_path = write_text(job / "asr" / "subtitles.secondary_review.raw_asr.srt", review_srt)
                 else:
                     if not current_srt.strip():
                         raise ValueError("二次审核需要音频，或至少需要 SRT。")
                     srt_path = write_text(job / "asr" / "subtitles.secondary_review.srt", current_srt)
+                    subtitle_source_mode = "editor"
                     raw_srt_path = latest_raw_asr_srt(job)
                     if raw_srt_path:
                         review_srt = raw_srt_path.read_text(encoding="utf-8-sig")
@@ -4611,6 +4674,7 @@ def create_ui(config: AppConfig):
                 message_parts = [
                     summary,
                     f"SRT: {srt_path}",
+                    f"Final subtitle text source: {subtitle_source_mode}",
                     f"Review source: {'raw ASR' if raw_srt_path else 'current SRT'}",
                     f"Local report: {local_report_path}",
                 ]
@@ -5693,7 +5757,27 @@ def create_ui(config: AppConfig):
                         job / "logs" / "render_audio_head_pad.txt",
                     )
                 srt_path = None
-                if srt_text.strip():
+                subtitle_source_mode = "none"
+                if (text or "").strip():
+                    audio_for_timing = Path(audio_value)
+                    final_blocks, subtitle_source_mode = final_subtitle_blocks_from_source_or_editor(
+                        config,
+                        text or "",
+                        srt_text or "",
+                    )
+                    if srt_text.strip() and "-->" in srt_text:
+                        timing_segments = srt_segments_from_text(srt_text)
+                        if timing_segments:
+                            srt_for_render = script_aligned_srt_from_blocks(config, audio_for_timing, timing_segments, final_blocks)
+                        else:
+                            srt_for_render = render_srt_from_editor(config, audio_for_timing, "\n\n".join(final_blocks), 0.0)
+                    else:
+                        srt_for_render = render_srt_from_editor(config, audio_for_timing, "\n\n".join(final_blocks), 0.0)
+                    if head_pad_seconds > 0:
+                        srt_for_render = shift_srt_timestamps(srt_for_render, head_pad_seconds)
+                    srt_path = write_text(job / "asr" / "subtitles.render_shifted.srt", srt_for_render)
+                elif srt_text.strip():
+                    subtitle_source_mode = "editor"
                     srt_for_render = render_srt_from_editor(config, Path(audio_value), srt_text, head_pad_seconds)
                     srt_path = write_text(job / "asr" / "subtitles.render_shifted.srt", srt_for_render)
                 bgm_path = copy_upload(bgm, job / "input" / "bgm") if bgm else None
@@ -5747,6 +5831,7 @@ def create_ui(config: AppConfig):
                             f"Video: {video}",
                             f"Render audio: {render_audio}",
                             f"Head pad: {head_pad_ms} ms",
+                            f"Subtitle text source: {subtitle_source_mode}",
                             f"Job: {job}",
                             f"Log: {job / 'logs' / 'render.txt'}",
                         ]

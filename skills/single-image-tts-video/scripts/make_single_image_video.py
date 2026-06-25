@@ -433,6 +433,39 @@ def generate_srt(audio: Path, model_path: Path, language: str, output: Path) -> 
     return segments
 
 
+def generate_srt_from_expected_text(
+    expected_text: str,
+    duration: float,
+    output: Path,
+    *,
+    max_chars: int,
+    keep_punctuation: bool,
+) -> list[SubtitleSegment]:
+    chunks: list[str] = []
+    for phrase in subtitle_phrase_chunks(expected_text, keep_punctuation=keep_punctuation):
+        chunks.extend(split_long_chunk(phrase, max(4, max_chars * 2)))
+    chunks = [chunk.strip() for chunk in chunks if normalize_text(chunk)]
+    if not chunks:
+        raise VideoWorkflowError("Expected text is empty; cannot create script-based subtitles.")
+
+    weights = [max(1, len(normalize_text(chunk))) for chunk in chunks]
+    total = max(1, sum(weights))
+    segments: list[SubtitleSegment] = []
+    cursor = 0.0
+    for index, (chunk, weight) in enumerate(zip(chunks, weights), start=1):
+        start = cursor
+        if index == len(chunks):
+            end = duration
+        else:
+            cursor += duration * (weight / total)
+            end = cursor
+        if end <= start:
+            end = min(duration, start + max(0.1, duration / max(1, len(chunks))))
+        segments.append(SubtitleSegment(index=index, start=start, end=end, text=chunk))
+    write_srt(segments, output)
+    return segments
+
+
 def read_srt_text(path: Path) -> str:
     text = path.read_text(encoding="utf-8-sig")
     lines = []
@@ -790,6 +823,8 @@ def main() -> int:
             raise VideoWorkflowError("--audio is required unless --crop-preview-only is used.")
         audio_src = resolve_path(args.audio)
         audio_work = copy_input(audio_src, out_dir / f"narration{audio_src.suffix.lower()}")
+        audio_duration = probe_duration(ffprobe, audio_work)
+        expected_text = read_expected_text(args)
         bgm_work: Path | None = None
         if args.bgm:
             bgm_src = resolve_path(args.bgm)
@@ -797,6 +832,14 @@ def main() -> int:
         srt_work = out_dir / "subtitles.srt"
         if args.srt:
             copy_input(resolve_path(args.srt), srt_work)
+        elif expected_text:
+            generate_srt_from_expected_text(
+                expected_text,
+                audio_duration,
+                srt_work,
+                max_chars=args.subtitle_max_chars,
+                keep_punctuation=args.keep_subtitle_punctuation,
+            )
         else:
             generate_srt(audio_work, resolve_path(args.asr_model), args.language, srt_work)
         sanitize_srt(
@@ -805,7 +848,6 @@ def main() -> int:
             keep_punctuation=args.keep_subtitle_punctuation,
         )
 
-        audio_duration = probe_duration(ffprobe, audio_work)
         video_path, ffmpeg_command, burned = render_video(
             ffmpeg=ffmpeg,
             image=image_work,
@@ -829,7 +871,6 @@ def main() -> int:
         )
         video_duration = probe_duration(ffprobe, video_path)
 
-        expected_text = read_expected_text(args)
         tts_check = run_tts_checker(args, audio_work, out_dir)
         qa_report = write_qa_report(
             out_dir,

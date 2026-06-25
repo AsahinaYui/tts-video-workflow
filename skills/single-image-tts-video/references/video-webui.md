@@ -131,6 +131,8 @@ Single-sentence patch:
 
 - Final subtitles follow the source script, not ASR wording.
 - Raw ASR is kept for review.
+- If source script text exists, stale ASR text in the SRT editor must be replaced by script text before review or render.
+- Rendering must pass a script-based SRT when source text exists; do not let the render script generate final subtitles directly from ASR.
 - Display subtitles should not include punctuation.
 - Punctuation remains useful internally for split boundaries.
 - TTS text should keep punctuation for natural GPT-SoVITS pauses.
