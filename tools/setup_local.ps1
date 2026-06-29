@@ -54,6 +54,51 @@ function Set-JsonProperty {
     }
 }
 
+function Test-FfmpegEncoder {
+    param(
+        [Parameter(Mandatory = $true)][string]$FfmpegPath,
+        [Parameter(Mandatory = $true)][string]$Encoder
+    )
+    if (-not (Test-Path -LiteralPath $FfmpegPath)) {
+        return $false
+    }
+    try {
+        $encoders = & $FfmpegPath -hide_banner -encoders 2>$null
+        return [bool]($encoders | Select-String -SimpleMatch $Encoder)
+    } catch {
+        return $false
+    }
+}
+
+function Find-PreferredFfmpeg {
+    param([Parameter(Mandatory = $true)][string]$BundledFfmpeg)
+
+    $candidates = New-Object System.Collections.Generic.List[string]
+    if ($env:FFMPEG) {
+        $candidates.Add($env:FFMPEG)
+    }
+    foreach ($cmd in Get-Command ffmpeg.exe -All -ErrorAction SilentlyContinue) {
+        $candidates.Add($cmd.Source)
+    }
+    $candidates.Add($BundledFfmpeg)
+
+    $seen = @{}
+    foreach ($candidate in $candidates) {
+        if ([string]::IsNullOrWhiteSpace($candidate)) {
+            continue
+        }
+        $full = [System.IO.Path]::GetFullPath($candidate)
+        if ($seen.ContainsKey($full)) {
+            continue
+        }
+        $seen[$full] = $true
+        if (Test-FfmpegEncoder $full "libx264") {
+            return $full
+        }
+    }
+    return [System.IO.Path]::GetFullPath($BundledFfmpeg)
+}
+
 if (-not (Test-Path -LiteralPath $ConfigExample)) {
     throw "Missing config example: $ConfigExample"
 }
@@ -82,8 +127,13 @@ if ([string]::IsNullOrWhiteSpace($AsrModel)) {
 $GptSoVitsRootFull = [System.IO.Path]::GetFullPath($GptSoVitsRoot)
 $AsrModelFull = [System.IO.Path]::GetFullPath($AsrModel)
 $PythonExe = Join-Path $GptSoVitsRootFull "runtime\python.exe"
-$Ffmpeg = Join-Path $GptSoVitsRootFull "runtime\ffmpeg.exe"
-$Ffprobe = Join-Path $GptSoVitsRootFull "runtime\ffprobe.exe"
+$BundledFfmpeg = Join-Path $GptSoVitsRootFull "runtime\ffmpeg.exe"
+$BundledFfprobe = Join-Path $GptSoVitsRootFull "runtime\ffprobe.exe"
+$Ffmpeg = Find-PreferredFfmpeg $BundledFfmpeg
+$Ffprobe = Join-Path (Split-Path -Parent $Ffmpeg) "ffprobe.exe"
+if (-not (Test-Path -LiteralPath $Ffprobe)) {
+    $Ffprobe = $BundledFfprobe
+}
 
 if ((Test-Path -LiteralPath $ConfigPath) -and -not $Force) {
     $overwrite = if ($NoPrompt) { "N" } else { Read-Host "video-webui\config.json already exists. Overwrite it? [y/N]" }

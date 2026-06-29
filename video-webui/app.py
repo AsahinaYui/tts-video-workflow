@@ -62,10 +62,10 @@ AUDIO_EXTENSIONS = {".wav", ".mp3", ".flac", ".ogg", ".aac", ".m4a"}
 BASE_MODEL_VALUE = "__use_pretrained_base__"
 BASE_MODEL_LABEL = "不使用模型（底模推理）"
 BROWSER_HEARTBEAT_INTERVAL_SECONDS = 5.0
-BROWSER_HEARTBEAT_TIMEOUT_SECONDS = 30.0
+BROWSER_UNLOAD_EXIT_DELAY_SECONDS = 20.0
 BROWSER_HEARTBEAT_LOCK = threading.Lock()
 BROWSER_HEARTBEAT_LAST = 0.0
-BROWSER_HEARTBEAT_WATCHDOG_STARTED = False
+BROWSER_HEARTBEAT_COUNTER = 0
 APP_CSS = """
 #video-webui .gradio-container {
     max-width: 1680px !important;
@@ -171,26 +171,29 @@ def patch_gradio_local_url_check() -> None:
     boot_log("patched gradio localhost url_ok check")
 
 
-def browser_heartbeat_watchdog() -> None:
-    boot_log("browser heartbeat watchdog started")
-    while True:
-        time.sleep(BROWSER_HEARTBEAT_INTERVAL_SECONDS)
-        with BROWSER_HEARTBEAT_LOCK:
-            last_seen = BROWSER_HEARTBEAT_LAST
-        if last_seen and time.monotonic() - last_seen > BROWSER_HEARTBEAT_TIMEOUT_SECONDS:
-            boot_log("browser heartbeat timed out; exiting WebUI process")
-            os._exit(0)
+def browser_unload_exit_worker(counter_at_unload: int) -> None:
+    boot_log("browser unload observed; waiting before exit")
+    time.sleep(BROWSER_UNLOAD_EXIT_DELAY_SECONDS)
+    with BROWSER_HEARTBEAT_LOCK:
+        still_unloaded = BROWSER_HEARTBEAT_COUNTER <= counter_at_unload
+    if still_unloaded:
+        boot_log("browser unload confirmed; exiting WebUI process")
+        os._exit(0)
 
 
 def note_browser_heartbeat() -> str:
-    global BROWSER_HEARTBEAT_LAST, BROWSER_HEARTBEAT_WATCHDOG_STARTED
+    global BROWSER_HEARTBEAT_LAST, BROWSER_HEARTBEAT_COUNTER
     with BROWSER_HEARTBEAT_LOCK:
         BROWSER_HEARTBEAT_LAST = time.monotonic()
-        if not BROWSER_HEARTBEAT_WATCHDOG_STARTED:
-            BROWSER_HEARTBEAT_WATCHDOG_STARTED = True
-            thread = threading.Thread(target=browser_heartbeat_watchdog, daemon=True)
-            thread.start()
+        BROWSER_HEARTBEAT_COUNTER += 1
     return ""
+
+
+def request_browser_unload_exit() -> None:
+    with BROWSER_HEARTBEAT_LOCK:
+        counter_at_unload = BROWSER_HEARTBEAT_COUNTER
+    thread = threading.Thread(target=browser_unload_exit_worker, args=(counter_at_unload,), daemon=True)
+    thread.start()
 
 
 @dataclass(frozen=True)
@@ -425,6 +428,13 @@ def process_output_text(value: Any) -> str:
 def config_int(config: AppConfig, key: str, default: int) -> int:
     try:
         return int(config.raw.get(key) or default)
+    except (TypeError, ValueError):
+        return default
+
+
+def config_float(config: AppConfig, key: str, default: float) -> float:
+    try:
+        return float(config.raw.get(key) or default)
     except (TypeError, ValueError):
         return default
 
@@ -1984,6 +1994,27 @@ def subtitle_srt_from_model(config: AppConfig, audio_path: Path, model: Any, lan
     return raw_srt, raw_srt, False
 
 
+def subtitle_srt_after_audio_edit(
+    config: AppConfig,
+    audio_path: Path,
+    model: Any,
+    language: str,
+    source_text: str,
+    editor_text: str,
+) -> tuple[str, str, bool, str]:
+    segments = transcribe_model_to_segments(audio_path, model, language)
+    raw_srt = segments_to_srt(segments)
+    if (source_text or "").strip():
+        display_srt, mode = srt_from_final_subtitle_text(config, audio_path, source_text or "", editor_text or "", segments)
+        if display_srt.strip():
+            return display_srt, raw_srt, True, mode
+
+    editor_blocks = editor_subtitle_blocks(config, editor_text or "")
+    if editor_blocks:
+        return script_aligned_srt_from_blocks(config, audio_path, segments, editor_blocks), raw_srt, False, "editor_line_breaks"
+    return raw_srt, raw_srt, False, "raw_asr"
+
+
 def latest_raw_asr_srt(job: Path) -> Path | None:
     asr_dir = job / "asr"
     if not asr_dir.exists():
@@ -3465,12 +3496,10 @@ def cut_audio_segment(config: AppConfig, source: Path, output: Path, start: floa
     command = [
         str(config.ffmpeg),
         "-y",
-        "-ss",
-        f"{start:.3f}",
-        "-t",
-        f"{max(0.03, end - start):.3f}",
         "-i",
         str(source),
+        "-af",
+        f"atrim=start={start:.6f}:end={end:.6f},asetpts=PTS-STARTPTS",
         "-ar",
         "44100",
         "-ac",
@@ -3526,6 +3555,16 @@ def quiet_boundary_in_analysis_wav(
     search_end: float,
 ) -> float:
     samples, rate = read_mono_i16_wav(analysis_wav)
+    return quiet_boundary_in_samples(samples, rate, boundary, search_start, search_end)
+
+
+def quiet_boundary_in_samples(
+    samples: array.array,
+    rate: int,
+    boundary: float,
+    search_start: float,
+    search_end: float,
+) -> float:
     if rate <= 0 or not samples:
         return boundary
     duration = len(samples) / float(rate)
@@ -3561,6 +3600,73 @@ def quiet_boundary_in_analysis_wav(
     return max(search_start, min(search_end, best_time))
 
 
+def manual_patch_boundary_search_seconds(config: AppConfig) -> float:
+    return max(0.08, min(1.2, config_float(config, "manual_patch_boundary_search_ms", 550.0) / 1000.0))
+
+
+def manual_patch_neighbor_bleed_seconds(config: AppConfig) -> float:
+    return max(0.0, min(0.25, config_float(config, "manual_patch_neighbor_bleed_ms", 80.0) / 1000.0))
+
+
+def manual_patch_crossfade_seconds(config: AppConfig) -> float:
+    return max(0.0, min(0.12, config_float(config, "manual_patch_crossfade_ms", 45.0) / 1000.0))
+
+
+def refine_patch_unit_boundaries_with_audio(
+    config: AppConfig,
+    audio_path: Path,
+    intervals: list[dict[str, Any]],
+    work_dir: Path,
+) -> list[dict[str, Any]]:
+    if len(intervals) < 2:
+        return intervals
+    refined = [dict(interval) for interval in intervals]
+    try:
+        analysis_wav = make_analysis_wav(config, audio_path, work_dir / "manual_patch_boundary_analysis.wav", work_dir / "manual_patch_boundary_analysis.txt")
+        analysis_samples, analysis_rate = read_mono_i16_wav(analysis_wav)
+        duration = audio_duration_seconds(config, audio_path) or float(refined[-1].get("end") or 0.0)
+        search = manual_patch_boundary_search_seconds(config)
+        min_unit = 0.05
+
+        for index in range(1, len(refined)):
+            previous = refined[index - 1]
+            current = refined[index]
+            previous_start = max(0.0, min(duration, float(previous.get("start") or 0.0)))
+            previous_end = max(previous_start + min_unit, min(duration, float(previous.get("end") or previous_start)))
+            current_start = max(0.0, min(duration, float(current.get("start") or previous_end)))
+            current_end = max(current_start + min_unit, min(duration, float(current.get("end") or current_start)))
+
+            raw_boundary = (previous_end + current_start) / 2.0
+            search_start = max(previous_start + min_unit, min(previous_end, current_start) - search)
+            search_end = min(current_end - min_unit, max(previous_end, current_start) + search)
+            if search_end - search_start < 0.02:
+                boundary = max(search_start, min(search_end, raw_boundary))
+                source = "audio_guarded"
+            else:
+                boundary = quiet_boundary_in_samples(analysis_samples, analysis_rate, raw_boundary, search_start, search_end)
+                source = "audio_quiet"
+
+            boundary = max(previous_start + min_unit, min(current_end - min_unit, boundary))
+            previous["raw_end"] = previous.get("end")
+            current["raw_start"] = current.get("start")
+            previous["end"] = boundary
+            current["start"] = boundary
+            previous["boundary_source"] = source
+            current["boundary_source"] = source
+
+        for interval in refined:
+            interval["start"] = max(0.0, min(duration, float(interval.get("start") or 0.0)))
+            interval["end"] = max(float(interval["start"]) + 0.04, min(duration, float(interval.get("end") or 0.0)))
+            interval["refined_with_audio"] = True
+        return refined
+    except Exception as exc:
+        fallback = [dict(interval) for interval in intervals]
+        for interval in fallback:
+            interval["refined_with_audio"] = False
+            interval["refine_error"] = str(exc)
+        return fallback
+
+
 def concat_audio_with_crossfade(config: AppConfig, audio_paths: list[Path], output: Path, fade_seconds: float, work_dir: Path) -> Path:
     if not audio_paths:
         raise ValueError("No audio segments to concatenate.")
@@ -3568,7 +3674,7 @@ def concat_audio_with_crossfade(config: AppConfig, audio_paths: list[Path], outp
         output.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(audio_paths[0], output)
         return output.resolve()
-    fade_seconds = max(0.0, min(0.08, float(fade_seconds or 0.0)))
+    fade_seconds = max(0.0, min(0.12, float(fade_seconds or 0.0)))
     if fade_seconds <= 0:
         return concat_audio_with_padding(config, audio_paths, output, 0.0, work_dir)
     durations = [audio_duration_seconds(config, path) for path in audio_paths]
@@ -3619,6 +3725,8 @@ def splice_audio_replace_range(
     start: float,
     end: float,
     work_dir: Path,
+    start_search: tuple[float, float] | None = None,
+    end_search: tuple[float, float] | None = None,
 ) -> Path:
     duration = audio_duration_seconds(config, source)
     if duration is None:
@@ -3628,24 +3736,58 @@ def splice_audio_replace_range(
     if end <= start:
         raise ValueError("替换区间无效，无法裁掉原音频片段。")
 
+    boundary_report: dict[str, Any] = {
+        "source": str(source),
+        "patch_audio": str(patch_audio),
+        "duration": duration,
+        "input_start": start,
+        "input_end": end,
+        "start_search": list(start_search) if start_search else None,
+        "end_search": list(end_search) if end_search else None,
+    }
+
     try:
         analysis_wav = make_analysis_wav(config, source, work_dir / "analysis_mono.wav", work_dir / "analysis_wav.txt")
+        if start_search is None:
+            start_window = (start, min(end - 0.05, start + 0.35))
+        else:
+            start_window = start_search
+        if end_search is None:
+            end_window = (max(start + 0.05, end - 0.35), end)
+        else:
+            end_window = end_search
+        start_window = (
+            max(0.0, min(duration, float(start_window[0]))),
+            max(0.0, min(duration, float(start_window[1]))),
+        )
+        end_window = (
+            max(0.0, min(duration, float(end_window[0]))),
+            max(0.0, min(duration, float(end_window[1]))),
+        )
         refined_start = quiet_boundary_in_analysis_wav(
             analysis_wav,
             start,
-            start,
-            min(end - 0.05, start + 0.35),
+            min(start_window),
+            max(start_window),
         )
         refined_end = quiet_boundary_in_analysis_wav(
             analysis_wav,
             end,
-            max(refined_start + 0.05, end - 0.35),
-            end,
+            max(refined_start + 0.05, min(end_window)),
+            max(end_window),
+        )
+        boundary_report.update(
+            {
+                "refined_start": refined_start,
+                "refined_end": refined_end,
+                "effective_start_search": [min(start_window), max(start_window)],
+                "effective_end_search": [max(refined_start + 0.05, min(end_window)), max(end_window)],
+            }
         )
         if refined_end - refined_start >= 0.05:
             start, end = refined_start, refined_end
-    except Exception:
-        pass
+    except Exception as exc:
+        boundary_report["refine_error"] = str(exc)
 
     parts: list[Path] = []
     work_dir.mkdir(parents=True, exist_ok=True)
@@ -3654,7 +3796,9 @@ def splice_audio_replace_range(
     parts.append(patch_audio)
     if duration - end > 0.02:
         parts.append(cut_audio_segment(config, source, work_dir / "after.wav", end, duration, work_dir / "cut_after.txt"))
-    return concat_audio_with_crossfade(config, parts, output, 0.035, work_dir / "concat")
+    boundary_report.update({"final_start": start, "final_end": end, "crossfade_seconds": manual_patch_crossfade_seconds(config)})
+    (work_dir / "splice_boundaries.json").write_text(json.dumps(boundary_report, ensure_ascii=False, indent=2), encoding="utf-8")
+    return concat_audio_with_crossfade(config, parts, output, manual_patch_crossfade_seconds(config), work_dir / "concat")
 
 
 def shift_srt_timestamps(srt_text: str, offset_seconds: float) -> str:
@@ -4439,6 +4583,12 @@ def create_ui(config: AppConfig):
                 segments, char_timeline = transcribe_model_to_segments_and_char_timeline(audio_path, asr_model, asr_language(text_lang_value))
                 raw_srt_text = segments_to_srt(segments)
                 intervals = patch_unit_intervals_from_timeline(config, audio_path, segments, units, char_timeline)
+                intervals = refine_patch_unit_boundaries_with_audio(
+                    config,
+                    audio_path,
+                    intervals,
+                    job / "logs" / "manual_patch_boundary_refine",
+                )
                 indexed_srt = "\n\n".join(
                     make_srt_block(index, float(interval["start"]), float(interval["end"]), str(unit["text"]))
                     for index, (unit, interval) in enumerate(zip(units, intervals), start=1)
@@ -4473,6 +4623,11 @@ def create_ui(config: AppConfig):
                             "source_audio": str(audio_path),
                             "start": start,
                             "end": end,
+                            "raw_start": interval.get("raw_start"),
+                            "raw_end": interval.get("raw_end"),
+                            "boundary_source": str(interval.get("boundary_source") or ""),
+                            "refined_with_audio": bool(interval.get("refined_with_audio")),
+                            "refine_error": str(interval.get("refine_error") or ""),
                             "alignment_source": str(interval.get("source") or ""),
                             "alignment_confidence": float(interval.get("confidence") or 0.0),
                             "audio": str(segment_audio),
@@ -4499,7 +4654,8 @@ def create_ui(config: AppConfig):
                             "",
                             *[
                                 f"- {entry['locator']} [{entry['start']:.3f}-{entry['end']:.3f}s, "
-                                f"{entry['alignment_source']}, confidence={entry['alignment_confidence']:.2f}]: "
+                                f"{entry['alignment_source']}, boundary={entry.get('boundary_source') or '-'}, "
+                                f"confidence={entry['alignment_confidence']:.2f}]: "
                                 f"`{entry['text']}` -> `{entry['audio']}`"
                                 for entry in entries
                             ],
@@ -4969,12 +5125,13 @@ def create_ui(config: AppConfig):
                         for index in range(1, len(chunks) + 1)
                     ],
                 )
-                patched_srt, raw_srt_text, aligned_to_script = subtitle_srt_from_model(
+                patched_srt, raw_srt_text, aligned_to_script, subtitle_source_mode = subtitle_srt_after_audio_edit(
                     config,
                     final_audio,
                     asr_model,
                     asr_language(text_lang_value),
                     text or "",
+                    current_srt,
                 )
                 srt_path = write_text(job / "asr" / "subtitles.secondary_auto_patch.srt", patched_srt)
                 raw_srt_path = write_text(job / "asr" / "subtitles.secondary_auto_patch.raw_asr.srt", raw_srt_text)
@@ -4989,6 +5146,7 @@ def create_ui(config: AppConfig):
                         "Patch mode: 按分段顺序重建音频；问题分段按逗号小句逐条生成后替换",
                         summary,
                         triad_report(text or "", patched_srt, raw_srt_text, aligned_to_script),
+                        f"Subtitle text source: {subtitle_source_mode}",
                         f"Audio: {final_audio}",
                         f"SRT: {srt_path}",
                         f"Raw ASR SRT: {raw_srt_path}",
@@ -5370,6 +5528,7 @@ def create_ui(config: AppConfig):
                 sequence_chunk_text = sequence_chunks[sequence_chunk_index - 1] if 1 <= sequence_chunk_index <= len(sequence_chunks) else ""
                 indexed_by_locator = any("sentence_index" in entry and "clause_index" in entry for entry in entries)
                 direct_splice_audio: Path | None = None
+                splice_report_path: Path | None = None
 
                 if indexed_by_locator:
                     target_units = [
@@ -5543,8 +5702,10 @@ def create_ui(config: AppConfig):
                         first_target_entry = entries[target_entry_indexes[0]]
 
                         if current_source.exists() and len(timed_target_entries) == len(target_entries):
-                            splice_start = min(float(entry["start"]) for entry in timed_target_entries)
-                            splice_end = max(float(entry["end"]) for entry in timed_target_entries)
+                            raw_splice_start = min(float(entry["start"]) for entry in timed_target_entries)
+                            raw_splice_end = max(float(entry["end"]) for entry in timed_target_entries)
+                            splice_start = raw_splice_start
+                            splice_end = raw_splice_end
                             previous_entries = [
                                 entry
                                 for index, entry in enumerate(entries[: min(target_entry_indexes)])
@@ -5555,12 +5716,29 @@ def create_ui(config: AppConfig):
                                 for index, entry in enumerate(entries[max(target_entry_indexes) + 1 :], start=max(target_entry_indexes) + 1)
                                 if index not in target_set and entry.get("start") is not None
                             ]
+                            search_seconds = manual_patch_boundary_search_seconds(config)
+                            neighbor_bleed = manual_patch_neighbor_bleed_seconds(config)
+                            previous_end = float(previous_entries[-1]["end"]) if previous_entries else None
+                            next_start = float(next_entries[0]["start"]) if next_entries else None
                             if previous_entries:
-                                splice_start = max(splice_start, float(previous_entries[-1]["end"]))
+                                splice_start = max(splice_start, float(previous_end) - neighbor_bleed)
                             if next_entries:
-                                splice_end = min(splice_end, float(next_entries[0]["start"]))
+                                splice_end = min(splice_end, float(next_start) + neighbor_bleed)
                             if splice_end <= splice_start:
                                 raise ValueError("替换区间被相邻编号保护夹空，请重新建立修补分段索引或改用更大的编号范围。")
+                            current_duration = audio_duration_seconds(config, current_source) or max(splice_end, raw_splice_end)
+                            start_search = (
+                                max(0.0, min(raw_splice_start, splice_start) - search_seconds),
+                                min(splice_end - 0.05, max(raw_splice_start, splice_start) + search_seconds),
+                            )
+                            end_search = (
+                                max(splice_start + 0.05, min(raw_splice_end, splice_end) - search_seconds),
+                                min(current_duration, max(raw_splice_end, splice_end) + search_seconds),
+                            )
+                            if previous_end is not None:
+                                start_search = (max(start_search[0], previous_end - neighbor_bleed), start_search[1])
+                            if next_start is not None:
+                                end_search = (end_search[0], min(end_search[1], next_start + neighbor_bleed))
                             direct_splice_audio = splice_audio_replace_range(
                                 config,
                                 current_source,
@@ -5569,7 +5747,17 @@ def create_ui(config: AppConfig):
                                 splice_start,
                                 splice_end,
                                 job / "logs" / "sentence_patch_direct_splice",
+                                start_search=start_search,
+                                end_search=end_search,
                             )
+                            splice_report_path = job / "logs" / "sentence_patch_direct_splice" / "splice_boundaries.json"
+                            if splice_report_path.exists():
+                                try:
+                                    splice_report = json.loads(splice_report_path.read_text(encoding="utf-8-sig"))
+                                    splice_start = float(splice_report.get("final_start", splice_start))
+                                    splice_end = float(splice_report.get("final_end", splice_end))
+                                except Exception:
+                                    pass
                             original_span = max(0.001, splice_end - splice_start)
                             patch_duration = audio_duration_seconds(config, final_patch_audio) or original_span
                             delta = patch_duration - original_span
@@ -5585,6 +5773,7 @@ def create_ui(config: AppConfig):
                                 "start": splice_start,
                                 "end": splice_start + patch_duration,
                                 "audio": str(final_patch_audio),
+                                "splice_report": str(splice_report_path) if splice_report_path else "",
                             }
                             rebuilt_entries: list[dict[str, Any]] = []
                             inserted_replacement = False
@@ -5598,8 +5787,15 @@ def create_ui(config: AppConfig):
                                 if updated_entry.get("start") is not None and updated_entry.get("end") is not None:
                                     old_start = float(updated_entry["start"])
                                     old_end = float(updated_entry["end"])
-                                    if old_start >= splice_end:
+                                    if old_end <= splice_start:
+                                        pass
+                                    elif old_start >= splice_end:
                                         updated_entry["start"] = old_start + delta
+                                        updated_entry["end"] = old_end + delta
+                                    elif old_start < splice_start < old_end:
+                                        updated_entry["end"] = splice_start
+                                    elif old_start < splice_end < old_end:
+                                        updated_entry["start"] = splice_start + patch_duration
                                         updated_entry["end"] = old_end + delta
                                     updated_entry["source_audio"] = str(direct_splice_audio)
                                 rebuilt_entries.append(updated_entry)
@@ -5691,12 +5887,13 @@ def create_ui(config: AppConfig):
                 from faster_whisper import WhisperModel  # type: ignore
 
                 asr_model = WhisperModel(str(config.asr_model), device="cpu", compute_type="int8")
-                patched_srt, raw_srt_text, aligned_to_script = subtitle_srt_from_model(
+                patched_srt, raw_srt_text, aligned_to_script, subtitle_source_mode = subtitle_srt_after_audio_edit(
                     config,
                     final_audio,
                     asr_model,
                     asr_language(text_lang_value),
                     text or "",
+                    srt_text or "",
                 )
                 srt_path = write_text(job / "asr" / "subtitles.sentence_patch.srt", patched_srt)
                 raw_srt_path = write_text(job / "asr" / "subtitles.sentence_patch.raw_asr.srt", raw_srt_text)
@@ -5712,6 +5909,8 @@ def create_ui(config: AppConfig):
                             f"- Target text: `{target_text}`",
                             f"- Candidate audio: `{candidate_audio}`",
                             f"- Applied audio: `{final_audio}`",
+                            f"- Splice report: `{splice_report_path}`" if splice_report_path else "- Splice report: -",
+                            f"- Subtitle text source: {subtitle_source_mode}",
                             f"- SRT: `{srt_path}`",
                             f"- Raw ASR SRT: `{raw_srt_path}`",
                             "",
@@ -5725,6 +5924,7 @@ def create_ui(config: AppConfig):
                         "单句补漏/替换已应用",
                         summary,
                         triad_report(text or "", patched_srt, raw_srt_text, aligned_to_script),
+                        f"Subtitle text source: {subtitle_source_mode}",
                         f"Audio: {final_audio}",
                         f"SRT: {srt_path}",
                         f"Raw ASR SRT: {raw_srt_path}",
@@ -6062,6 +6262,7 @@ def create_ui(config: AppConfig):
             queue=False,
             show_progress="hidden",
         )
+        demo.unload(request_browser_unload_exit)
 
     return demo
 

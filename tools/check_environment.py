@@ -135,6 +135,42 @@ def check_executable_version(checks: list[Check], name: str, exe: Path | None, a
     add(checks, "OK" if ok else "WARN", name, detail)
 
 
+def check_ffmpeg_encoder(checks: list[Check], ffmpeg: Path | None, encoder: str) -> None:
+    if not ffmpeg or not ffmpeg.is_file():
+        add(checks, "FAIL", f"FFmpeg encoder {encoder}", "missing ffmpeg")
+        return
+    ok, detail = run_probe([str(ffmpeg), "-hide_banner", "-encoders"], timeout=20)
+    if not ok:
+        add(checks, "FAIL", f"FFmpeg encoder {encoder}", detail)
+        return
+    if encoder in detail:
+        add(checks, "OK", f"FFmpeg encoder {encoder}", "available")
+        return
+    try:
+        all_encoders = subprocess.run(
+            [str(ffmpeg), "-hide_banner", "-encoders"],
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=20,
+            check=False,
+        ).stdout
+    except Exception as exc:  # noqa: BLE001 - diagnostic tool should report any probe error.
+        add(checks, "FAIL", f"FFmpeg encoder {encoder}", str(exc))
+        return
+    if encoder in all_encoders:
+        add(checks, "OK", f"FFmpeg encoder {encoder}", "available")
+        return
+    add(
+        checks,
+        "FAIL",
+        f"FFmpeg encoder {encoder}",
+        "not available; use a full ffmpeg build for final video renders",
+    )
+
+
 def check_port(checks: list[Check], host: str, port: int) -> None:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.settimeout(1.0)
@@ -243,6 +279,7 @@ def build_checks(config_path: Path) -> list[Check]:
     ffprobe = check_file(checks, "FFprobe", config.get("ffprobe"), base=config_base, required=True)
     check_executable_version(checks, "FFmpeg version", ffmpeg)
     check_executable_version(checks, "FFprobe version", ffprobe)
+    check_ffmpeg_encoder(checks, ffmpeg, "libx264")
 
     check_file(checks, "TTS script", config.get("gsv_tts_script"), base=config_base, required=True)
     check_file(checks, "TTS checker script", config.get("tts_checker_script"), base=config_base, required=True)

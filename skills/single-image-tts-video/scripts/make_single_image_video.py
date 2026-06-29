@@ -38,6 +38,24 @@ class VideoWorkflowError(RuntimeError):
     """User-facing video workflow error."""
 
 
+def video_codec_attempts() -> list[tuple[str, list[str]]]:
+    return [
+        (
+            "libx264",
+            [
+                "-preset",
+                "slow",
+                "-tune",
+                "stillimage",
+                "-crf",
+                "14",
+                "-x264-params",
+                "keyint=250:min-keyint=25:scenecut=40",
+            ],
+        ),
+    ]
+
+
 @dataclass(frozen=True)
 class SubtitleSegment:
     index: int
@@ -116,6 +134,11 @@ def parse_args() -> argparse.Namespace:
         "--keep-subtitle-punctuation",
         action="store_true",
         help="Do not remove punctuation from subtitle text.",
+    )
+    parser.add_argument(
+        "--rewrite-srt-layout",
+        action="store_true",
+        help="When --srt is supplied, rewrap subtitle lines instead of preserving the SRT layout.",
     )
     parser.add_argument("--require-tts-pass", action="store_true", help="Fail if the TTS checker fails.")
     parser.add_argument("--keep-existing", action="store_true", help="Do not delete an existing output folder.")
@@ -279,6 +302,91 @@ def probe_duration(ffprobe: Path, media: Path) -> float:
     return duration
 
 
+def percentile(values: list[float], p: float) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    index = min(len(ordered) - 1, max(0, int(round((len(ordered) - 1) * p))))
+    return ordered[index]
+
+
+def analyze_render_flicker(
+    ffmpeg: Path,
+    video: Path,
+    out_dir: Path,
+    width: int,
+    height: int,
+) -> dict[str, Any]:
+    sample_height = max(64, min(500, height // 4))
+    log_path = out_dir / "flicker_signalstats_top.txt"
+    stderr_path = out_dir / "flicker_check_stderr.txt"
+    command = [
+        str(ffmpeg),
+        "-v",
+        "error",
+        "-i",
+        video.name,
+        "-vf",
+        f"crop={width}:{sample_height}:0:0,signalstats,metadata=print:file={log_path.name}",
+        "-f",
+        "null",
+        "-",
+    ]
+    completed = subprocess.run(
+        command,
+        cwd=str(out_dir),
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        capture_output=True,
+    )
+    stderr_path.write_text(completed.stderr, encoding="utf-8")
+    if completed.returncode != 0 or not log_path.exists():
+        result = {
+            "status": "SKIPPED",
+            "reason": "signalstats failed",
+            "sample_region": f"{width}x{sample_height}+0+0",
+        }
+        (out_dir / "flicker_check.json").write_text(
+            json.dumps(result, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        return result
+
+    ydifs: list[float] = []
+    for line in log_path.read_text(encoding="utf-8", errors="ignore").splitlines():
+        if line.startswith("lavfi.signalstats.YDIF="):
+            try:
+                value = float(line.split("=", 1)[1])
+            except ValueError:
+                continue
+            if value > 0:
+                ydifs.append(value)
+
+    frame_count = len(ydifs)
+    jump_threshold = 0.35
+    jump_count = sum(1 for value in ydifs if value > jump_threshold)
+    review_count = max(20, int(frame_count * 0.03))
+    p95 = percentile(ydifs, 0.95)
+    result = {
+        "status": "REVIEW" if p95 > jump_threshold and jump_count >= review_count else "PASS",
+        "sample_region": f"{width}x{sample_height}+0+0",
+        "frame_count": frame_count,
+        "ydif_mean": (sum(ydifs) / frame_count) if frame_count else 0.0,
+        "ydif_p95": p95,
+        "ydif_max": max(ydifs) if ydifs else 0.0,
+        "jump_threshold": jump_threshold,
+        "jump_count": jump_count,
+        "review_count": review_count,
+        "log": str(log_path),
+    }
+    (out_dir / "flicker_check.json").write_text(
+        json.dumps(result, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return result
+
+
 def srt_time(seconds: float) -> str:
     seconds = max(0.0, seconds)
     millis = int(round(seconds * 1000))
@@ -391,7 +499,19 @@ def format_subtitle_text(text: str, *, max_chars: int, keep_punctuation: bool) -
     return wrap_subtitle_text(text.strip(), max_chars, keep_punctuation=keep_punctuation)
 
 
-def sanitize_srt(path: Path, *, max_chars: int, keep_punctuation: bool) -> None:
+def format_existing_subtitle_lines(text_lines: list[str], *, keep_punctuation: bool) -> str:
+    lines: list[str] = []
+    for line in text_lines:
+        cleaned = line.strip()
+        if not keep_punctuation:
+            cleaned = "".join(char for char in cleaned if not is_punctuation(char))
+        cleaned = re.sub(r"[ \t]+", " ", cleaned).strip()
+        if cleaned:
+            lines.append(cleaned)
+    return "\n".join(lines)
+
+
+def sanitize_srt(path: Path, *, max_chars: int, keep_punctuation: bool, preserve_layout: bool = False) -> None:
     raw = path.read_text(encoding="utf-8-sig")
     blocks: list[str] = []
     for block in re.split(r"\n\s*\n", raw.strip()):
@@ -400,11 +520,14 @@ def sanitize_srt(path: Path, *, max_chars: int, keep_punctuation: bool) -> None:
             continue
         index = lines[0]
         timing = lines[1]
-        text = format_subtitle_text(
-            "".join(lines[2:]),
-            max_chars=max_chars,
-            keep_punctuation=keep_punctuation,
-        )
+        if preserve_layout:
+            text = format_existing_subtitle_lines(lines[2:], keep_punctuation=keep_punctuation)
+        else:
+            text = format_subtitle_text(
+                "".join(lines[2:]),
+                max_chars=max_chars,
+                keep_punctuation=keep_punctuation,
+            )
         if text:
             blocks.append("\n".join([index, timing, text]))
     if not blocks:
@@ -588,7 +711,7 @@ def render_video(
     video_filter = ",".join(vf_parts)
 
     attempts: list[tuple[str, list[str], subprocess.CompletedProcess[str]]] = []
-    for video_codec in ("libx264", "mpeg4"):
+    for video_codec, codec_options in video_codec_attempts():
         command = [
             str(ffmpeg),
             "-y",
@@ -646,10 +769,7 @@ def render_video(
                 ]
             )
         command.extend(["-t", f"{duration:.3f}", "-c:v", video_codec])
-        if video_codec == "libx264":
-            command.extend(["-preset", "medium", "-tune", "stillimage"])
-        else:
-            command.extend(["-q:v", "3"])
+        command.extend(codec_options)
         command.extend(
             [
                 "-pix_fmt",
@@ -658,6 +778,8 @@ def render_video(
                 "aac",
                 "-b:a",
                 "192k",
+                "-movflags",
+                "+faststart",
                 "-shortest",
                 output.name,
             ]
@@ -686,7 +808,8 @@ def render_video(
         encoding="utf-8",
     )
 
-    if burn_subtitles:
+    missing_x264 = video_codec == "libx264" and "Unknown encoder 'libx264'" in completed.stderr
+    if burn_subtitles and not missing_x264:
         fallback = output.with_name(output.stem + "_sidecar_subtitles.mp4")
         fallback_output, fallback_command, burned = render_video(
             ffmpeg=ffmpeg,
@@ -715,6 +838,12 @@ def render_video(
         )
         return fallback_output, fallback_command, burned
 
+    if missing_x264:
+        raise VideoWorkflowError(
+            "Video render requires an ffmpeg build with libx264. "
+            "Install a full ffmpeg build or update config.json to point at one; "
+            "the bundled GPT-SoVITS ffmpeg may not include libx264."
+        )
     raise VideoWorkflowError(f"ffmpeg failed:\n{completed.stderr[-3000:]}")
 
 
@@ -726,6 +855,7 @@ def write_qa_report(
     srt_path: Path,
     expected_text: str | None,
     tts_check: dict[str, Any] | None,
+    flicker_check: dict[str, Any],
     burned_subtitles: bool,
 ) -> Path:
     srt_text = read_srt_text(srt_path)
@@ -735,6 +865,7 @@ def write_qa_report(
         f"- Audio duration: {audio_duration:.3f}s",
         f"- Video duration: {video_duration:.3f}s",
         f"- Burned subtitles: {'yes' if burned_subtitles else 'no'}",
+        f"- Flicker check: {flicker_check.get('status', 'UNKNOWN')}",
         f"- SRT: `{srt_path}`",
         "",
         "## SRT Text",
@@ -742,6 +873,22 @@ def write_qa_report(
         srt_text,
         "",
     ]
+    if flicker_check.get("status") == "REVIEW":
+        lines.extend(
+            [
+                "## Flicker Review",
+                "",
+                (
+                    "The rendered MP4 shows repeated brightness jumps in the top static region. "
+                    "Do not continue editing this file before checking the preview."
+                ),
+                "",
+                f"- YDIF p95: {float(flicker_check.get('ydif_p95', 0.0)):.4f}",
+                f"- Jump count: {flicker_check.get('jump_count')} / {flicker_check.get('frame_count')}",
+                f"- Signalstats log: `{flicker_check.get('log')}`",
+                "",
+            ]
+        )
     if expected_text:
         expected_norm = normalize_text(expected_text)
         srt_norm = normalize_text(srt_text)
@@ -846,6 +993,7 @@ def main() -> int:
             srt_work,
             max_chars=args.subtitle_max_chars,
             keep_punctuation=args.keep_subtitle_punctuation,
+            preserve_layout=bool(args.srt) and not args.rewrite_srt_layout,
         )
 
         video_path, ffmpeg_command, burned = render_video(
@@ -870,6 +1018,12 @@ def main() -> int:
             bgm_ducking=not args.no_bgm_ducking,
         )
         video_duration = probe_duration(ffprobe, video_path)
+        flicker_check = analyze_render_flicker(ffmpeg, video_path, out_dir, width, height)
+        if flicker_check.get("status") == "REVIEW":
+            print(
+                "WARNING: Flicker check needs review; see flicker_check.json before editing this MP4.",
+                file=sys.stderr,
+            )
 
         tts_check = run_tts_checker(args, audio_work, out_dir)
         qa_report = write_qa_report(
@@ -879,6 +1033,7 @@ def main() -> int:
             srt_path=srt_work,
             expected_text=expected_text,
             tts_check=tts_check,
+            flicker_check=flicker_check,
             burned_subtitles=burned,
         )
 
@@ -912,6 +1067,7 @@ def main() -> int:
             "bgm_fade_out": args.bgm_fade_out if bgm_work else None,
             "bgm_ducking": (not args.no_bgm_ducking) if bgm_work else None,
             "burned_subtitles": burned,
+            "flicker_check": flicker_check,
             "ffmpeg": str(ffmpeg),
             "ffprobe": str(ffprobe),
             "work_assets_kept": args.keep_work_assets,

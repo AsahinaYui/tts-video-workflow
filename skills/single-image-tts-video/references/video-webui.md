@@ -127,6 +127,12 @@ Single-sentence patch:
 - Raw ASR is preferred for deciding missing vs replacement because final script-aligned subtitles may already contain text that the audio omitted.
 - A complete segment audio map from `2b. 分段 TTS 自动修复` is still required so replacement can preserve the original narration order.
 
+Manual patch cut accuracy:
+
+- Manual patch indexing first estimates clause times from Faster-Whisper word timestamps, then snaps every adjacent clause boundary to the quietest nearby audio valley.
+- Direct replacement uses sample-accurate `atrim` cuts, guarded neighbor search windows, and a short crossfade. It writes the real cut range to `logs/sentence_patch_direct_splice/splice_boundaries.json`.
+- If the bad audio crosses a boundary, select the continuous range together, for example `3.2,4.1`; this gives the cutter permission to replace the whole damaged span instead of guessing across a protected neighbor.
+
 ## Subtitle Rules
 
 - Final subtitles follow the source script, not ASR wording.
@@ -144,6 +150,16 @@ Single-sentence patch:
 - A blank line creates a new subtitle page when running `4b. 按编辑器重排时间轴`.
 - After `4b`, the editor is rewritten as SRT blocks whose text lines match final display wrapping.
 - Rendering uses the SRT editor pages and line breaks as the final subtitle pages and line breaks; do not rewrap them during final render.
+
+Subtitle/audio isolation:
+
+- Audio repair may retime subtitles against the repaired audio, but it must preserve the current SRT editor page grouping and line breaks when the editor text still matches the source script.
+- Existing SRT files passed to the render script preserve their line layout by default; use `--rewrite-srt-layout` only when explicitly rewrapping a raw external SRT.
+
+Codec rules:
+
+- Require H.264 through `libx264` for final MP4 previews. The bundled GPT-SoVITS ffmpeg may not include `libx264`, so the WebUI config should point at a full system ffmpeg build when available.
+- Do not use `mpeg4/mp4v` for still-image videos; its frequent I/P-frame reconstruction differences can look like periodic image flicker and will survive later editing in tools such as Jianying/CapCut.
 
 Key WebUI functions:
 

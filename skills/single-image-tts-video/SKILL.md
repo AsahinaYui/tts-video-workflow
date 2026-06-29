@@ -64,13 +64,14 @@ When the user sends a music file while making a video, use it as background musi
 - Image fit: fill the frame with a 9:16 crop. Do not add black bars unless the user explicitly asks to preserve the full image.
 - Audio codec: AAC, 192 kbps.
 - BGM default: sidechain ducking on, volume `0.12`, fade in `1.5s`, fade out `3.0s`.
-- Video codec: try H.264 first; if the bundled ffmpeg lacks `libx264`, fall back to MP4 `mpeg4`, `yuv420p`.
+- Video codec: require H.264 through `libx264` for final MP4 renders. Do not silently fall back to `mpeg4/mp4v` or hardware H.264 for still-image videos; those paths can introduce periodic flicker that survives later editing.
 - Subtitle style: bold white Chinese subtitles with black outline, centered near the lower safe area, matching `mutsmi_4.mp4`.
 - Subtitle text: no punctuation by default; wrap long entries with `--subtitle-max-chars 14` unless the user asks for a different density.
 - Subtitle safe area: keep horizontal and bottom margins so burned subtitles do not touch the frame edge.
 - Temporary copied source image, narration audio, BGM, and SRT sidecar are deleted by default after a burned-subtitle MP4 is exported. Pass `--keep-work-assets` only when those files are needed for manual editing.
-- ffmpeg path: configured in `config.json`, or pass `--ffmpeg`.
+- ffmpeg path: configured in `config.json`, or pass `--ffmpeg`. Prefer a full system ffmpeg build with `libx264`; the bundled GPT-SoVITS ffmpeg may not include it.
 - ffprobe path: configured in `config.json`, or pass `--ffprobe`.
+- After each final render, inspect the top static region for repeated brightness jumps. If `flicker_check.json` reports `REVIEW`, do not continue editing that MP4 until the preview has been checked or re-rendered.
 
 If the user requests a horizontal or square video, change `--resolution`.
 
