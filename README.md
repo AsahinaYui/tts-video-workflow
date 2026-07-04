@@ -4,6 +4,8 @@
 
 A local single-image narration video workflow built around GPT-SoVITS, Faster-Whisper, FFmpeg, and a Gradio WebUI.
 
+For current maintainer handoff notes, active runtime paths, and deprecated UI warnings, read [`PROJECT_STATE.md`](PROJECT_STATE.md) before making workflow changes.
+
 This repository contains:
 
 - `video-webui/`: the local Gradio video production WebUI.

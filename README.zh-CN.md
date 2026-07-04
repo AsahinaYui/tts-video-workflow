@@ -4,6 +4,8 @@
 
 本仓库是本地单图口播视频工作流的代码整理版，包含：
 
+新对话或继续维护前，请先阅读 [`PROJECT_STATE.md`](PROJECT_STATE.md)，其中记录了当前运行目录、旧版目录避坑、按钮流程和修补逻辑。
+
 - `video-webui/`：Gradio 本地视频制作 WebUI。
 - `skills/gptsovits-tts/`：GPT-SoVITS TTS 调用、参数切换、音频校验和后处理脚本。
 - `skills/single-image-tts-video/`：单图生成竖屏视频、字幕和 Premiere 辅助文件。
