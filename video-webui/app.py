@@ -66,6 +66,8 @@ BROWSER_UNLOAD_EXIT_DELAY_SECONDS = 20.0
 BROWSER_HEARTBEAT_LOCK = threading.Lock()
 BROWSER_HEARTBEAT_LAST = 0.0
 BROWSER_HEARTBEAT_COUNTER = 0
+ACTIVE_TASK_LOCK = threading.Lock()
+ACTIVE_TASKS = 0
 APP_CSS = """
 #video-webui .gradio-container {
     max-width: 1680px !important;
@@ -176,9 +178,13 @@ def browser_unload_exit_worker(counter_at_unload: int) -> None:
     time.sleep(BROWSER_UNLOAD_EXIT_DELAY_SECONDS)
     with BROWSER_HEARTBEAT_LOCK:
         still_unloaded = BROWSER_HEARTBEAT_COUNTER <= counter_at_unload
-    if still_unloaded:
+    with ACTIVE_TASK_LOCK:
+        active_tasks = ACTIVE_TASKS
+    if still_unloaded and active_tasks <= 0:
         boot_log("browser unload confirmed; exiting WebUI process")
         os._exit(0)
+    if still_unloaded:
+        boot_log(f"browser unload ignored while {active_tasks} task(s) are active")
 
 
 def note_browser_heartbeat() -> str:
@@ -440,28 +446,37 @@ def config_float(config: AppConfig, key: str, default: float) -> float:
 
 
 def run_command(command: list[str], cwd: Path, log_path: Path, timeout: int | None = None) -> subprocess.CompletedProcess[str]:
+    global ACTIVE_TASKS
     log_path.parent.mkdir(parents=True, exist_ok=True)
     started = time.strftime("%Y-%m-%d %H:%M:%S")
     header = "Started: " + started + "\nCommand: " + subprocess.list2cmdline(command) + "\n\n"
+    with ACTIVE_TASK_LOCK:
+        ACTIVE_TASKS += 1
     try:
-        completed = subprocess.run(
-            command,
-            cwd=str(cwd),
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            capture_output=True,
-            timeout=timeout,
-        )
-    except subprocess.TimeoutExpired as exc:
-        stdout = process_output_text(exc.stdout)
-        stderr = process_output_text(exc.stderr)
-        timeout_message = f"Timed out after {timeout} seconds."
-        if stderr:
-            stderr += "\n" + timeout_message
-        else:
-            stderr = timeout_message
-        completed = subprocess.CompletedProcess(command, 124, stdout, stderr)
+        try:
+            completed = subprocess.run(
+                command,
+                cwd=str(cwd),
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                capture_output=True,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired as exc:
+            stdout = process_output_text(exc.stdout)
+            stderr = process_output_text(exc.stderr)
+            timeout_message = f"Timed out after {timeout} seconds."
+            if stderr:
+                stderr += "\n" + timeout_message
+            else:
+                stderr = timeout_message
+            completed = subprocess.CompletedProcess(command, 124, stdout, stderr)
+        except Exception:
+            completed = subprocess.CompletedProcess(command, 1, "", traceback.format_exc())
+    finally:
+        with ACTIVE_TASK_LOCK:
+            ACTIVE_TASKS = max(0, ACTIVE_TASKS - 1)
     log_path.write_text(
         header
         + "Return code: "
@@ -4678,7 +4693,7 @@ def create_ui(config: AppConfig):
                 )
                 return str(audio_path), str(audio_path), str(srt_path), format_srt_for_editor(config, indexed_srt), listing, message
             except Exception:
-                return None, audio_value or "", "", "", traceback.format_exc(), traceback.format_exc()
+                return audio_value or None, audio_value or "", "", "", traceback.format_exc(), traceback.format_exc()
 
         def retime_srt_from_editor(job_value: str, audio_value: str, srt_text: str, text: str, text_lang_value: str):
             try:
@@ -5155,7 +5170,7 @@ def create_ui(config: AppConfig):
                 )
                 return str(final_audio), str(final_audio), str(srt_path), format_srt_for_editor(config, patched_srt), final_review, message
             except Exception:
-                return None, audio_value or "", "", srt_text or "", "", traceback.format_exc()
+                return audio_value or None, audio_value or "", "", srt_text or "", "", traceback.format_exc()
 
         def generate_tts_repaired_then_auto_patch(
             job_value: str,
@@ -5381,6 +5396,7 @@ def create_ui(config: AppConfig):
 
                 candidate = {
                     "audio": str(audio_path),
+                    "base_audio": str(audio_value or ""),
                     "target_text": target_text,
                     "chunk_index": int(target["chunk_index"]),
                     "clause_index": target.get("clause_index"),
@@ -5429,9 +5445,9 @@ def create_ui(config: AppConfig):
                         f"Report: {report_path}",
                     ]
                 )
-                return json.dumps(candidate, ensure_ascii=False), str(export_audio), str(export_audio), message
+                return json.dumps(candidate, ensure_ascii=False), str(export_audio), message
             except Exception:
-                return "", None, None, traceback.format_exc()
+                return "", None, traceback.format_exc()
 
         def export_sentence_patch_candidate(job_value: str, candidate_state: str, audio_value: str):
             try:
@@ -5512,6 +5528,24 @@ def create_ui(config: AppConfig):
                     raise FileNotFoundError(f"单句候选音频不存在: {candidate_audio}")
 
                 chunk_chars = int(chunk_chars_value or 70)
+                current_source_audio = Path(str(audio_value or "")).expanduser()
+                if not current_source_audio.exists():
+                    raise FileNotFoundError(f"当前整段音频不存在: {current_source_audio}")
+                candidate_base_audio = str(candidate.get("base_audio") or "").strip()
+                if candidate_base_audio:
+                    try:
+                        if Path(candidate_base_audio).expanduser().resolve() != current_source_audio.resolve():
+                            raise ValueError("当前整段音频已经变更，请重新生成单句试听后再应用，避免把旧候选套到新音频上。")
+                    except OSError:
+                        raise ValueError("当前整段音频已经变更，请重新生成单句试听后再应用。")
+                current_duration_before = audio_duration_seconds(config, current_source_audio)
+                patch_duration_before = audio_duration_seconds(config, candidate_audio)
+                locator_for_output = str(candidate.get("target_locator") or "") or str(candidate.get("chunk_index") or "manual")
+                apply_audio_dir = job / "tts" / "sentence_patch" / "applied_audio"
+                apply_audio_dir.mkdir(parents=True, exist_ok=True)
+                apply_audio_output = apply_audio_dir / f"{now_slug()}_{safe_name(locator_for_output)}.wav"
+                stable_apply_audio = job / "tts" / "tts_sentence_patch_applied.wav"
+
                 sequence_chunks, entries = load_audio_sequence_for_patch(job, text or "", chunk_chars)
                 patch_chunk_index = int(candidate.get("chunk_index") or 0)
                 if patch_chunk_index < 1:
@@ -5691,6 +5725,8 @@ def create_ui(config: AppConfig):
                                 f"替换目标 {str(candidate.get('target_locator') or '') or patch_locator_text(patch_chunk_index, candidate.get('clause_indices') or [], candidate.get('clause_index'))} 没有可剪掉的原音频小段。"
                                 "请先点击“3. 建立修补分段索引”。"
                             )
+                        if len(consecutive_int_groups(target_entry_indexes)) != 1:
+                            raise ValueError("替换目标在当前分段索引中不连续，已停止应用；请重新建立修补分段索引。")
                         target_entries = [entries[index] for index in target_entry_indexes]
                         timed_target_entries = [
                             entry
@@ -5701,7 +5737,12 @@ def create_ui(config: AppConfig):
                         target_set = set(target_entry_indexes)
                         first_target_entry = entries[target_entry_indexes[0]]
 
-                        if current_source.exists() and len(timed_target_entries) == len(target_entries):
+                        # Direct time-range splicing is too risky for hand repairs:
+                        # a slightly wrong ASR boundary can cut into neighboring clauses.
+                        # Rebuild from the patch index instead so preview candidates
+                        # cannot swallow unrelated audio when applied.
+                        allow_direct_splice = False
+                        if allow_direct_splice and current_source.exists() and len(timed_target_entries) == len(target_entries):
                             raw_splice_start = min(float(entry["start"]) for entry in timed_target_entries)
                             raw_splice_end = max(float(entry["end"]) for entry in timed_target_entries)
                             splice_start = raw_splice_start
@@ -5743,7 +5784,7 @@ def create_ui(config: AppConfig):
                                 config,
                                 current_source,
                                 final_patch_audio,
-                                job / "tts" / "tts_sentence_patch_applied.wav",
+                                apply_audio_output,
                                 splice_start,
                                 splice_end,
                                 job / "logs" / "sentence_patch_direct_splice",
@@ -5878,10 +5919,27 @@ def create_ui(config: AppConfig):
                     final_audio = concat_audio_with_padding(
                         config,
                         ordered_audio,
-                        job / "tts" / "tts_sentence_patch_applied.wav",
+                        apply_audio_output,
                         pad_seconds,
                         job / "logs" / "sentence_patch_concat",
                     )
+                final_duration_after = audio_duration_seconds(config, final_audio)
+                if (
+                    current_duration_before
+                    and final_duration_after
+                    and current_duration_before > 5.0
+                    and final_duration_after < current_duration_before * 0.35
+                ):
+                    raise RuntimeError(
+                        "应用后的音频异常短，已停止更新主音频。"
+                        f" 原时长 {current_duration_before:.2f}s，结果 {final_duration_after:.2f}s。"
+                    )
+                if patch_duration_before and final_duration_after and final_duration_after < patch_duration_before * 0.8:
+                    raise RuntimeError("应用后的音频比候选单句还短，已停止更新主音频。")
+                if final_audio.resolve() != stable_apply_audio.resolve():
+                    stable_apply_audio.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(final_audio, stable_apply_audio)
+                    final_audio = stable_apply_audio.resolve()
                 save_audio_sequence(job, sequence_chunks, entries)
 
                 from faster_whisper import WhisperModel  # type: ignore
@@ -6228,7 +6286,7 @@ def create_ui(config: AppConfig):
                 auto_retries,
                 auto_pass_cer,
             ],
-            outputs=[sentence_patch_state, sentence_patch_audio, generated_audio, status],
+            outputs=[sentence_patch_state, sentence_patch_audio, status],
             api_name="sentence_patch_preview",
         )
         btn_sentence_patch_apply.click(

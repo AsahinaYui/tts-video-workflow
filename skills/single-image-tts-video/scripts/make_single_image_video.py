@@ -998,7 +998,10 @@ def main() -> int:
 
         video_path, ffmpeg_command, burned = render_video(
             ffmpeg=ffmpeg,
-            image=image_work,
+            # Render from the cleaned crop preview instead of looping the raw
+            # uploaded image. Some PNG files decode one frame but fail when
+            # looped directly, producing a one-frame MP4.
+            image=crop_preview,
             audio=audio_work,
             bgm=bgm_work,
             srt=srt_work,
@@ -1008,9 +1011,9 @@ def main() -> int:
             fps=args.fps,
             duration=audio_duration,
             burn_subtitles=not args.no_burn_subtitles,
-            fit=args.fit,
-            crop_x=crop_x,
-            crop_y=crop_y,
+            fit="pad",
+            crop_x=0.5,
+            crop_y=0.5,
             bgm_volume=args.bgm_volume,
             bgm_start=args.bgm_start,
             bgm_fade_in=args.bgm_fade_in,
@@ -1058,6 +1061,7 @@ def main() -> int:
             "resolution": f"{width}x{height}",
             "fps": args.fps,
             "fit": args.fit,
+            "render_frame": str(crop_preview),
             "crop_preview": str(crop_preview),
             "crop_x": crop_x,
             "crop_y": crop_y,

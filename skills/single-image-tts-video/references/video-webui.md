@@ -155,11 +155,14 @@ Subtitle/audio isolation:
 
 - Audio repair may retime subtitles against the repaired audio, but it must preserve the current SRT editor page grouping and line breaks when the editor text still matches the source script.
 - Existing SRT files passed to the render script preserve their line layout by default; use `--rewrite-srt-layout` only when explicitly rewrapping a raw external SRT.
+- Single-sentence patch preview is isolated from the main narration audio. Generating a candidate only updates the small patch preview/player and candidate state; the main narration player/state changes only after applying the candidate.
+- Applying a sentence patch should rebuild from the current patch index and validate the result before updating the main audio. Do not directly splice current audio by ASR time boundaries during manual repairs, because a boundary miss can cut neighboring clauses.
 
 Codec rules:
 
 - Require H.264 through `libx264` for final MP4 previews. The bundled GPT-SoVITS ffmpeg may not include `libx264`, so the WebUI config should point at a full system ffmpeg build when available.
 - Do not use `mpeg4/mp4v` for still-image videos; its frequent I/P-frame reconstruction differences can look like periodic image flicker and will survive later editing in tools such as Jianying/CapCut.
+- The final render should loop the cleaned crop-preview image, not the raw upload. Some uploaded PNGs decode a preview but fail when looped directly, producing a one-frame MP4.
 
 Key WebUI functions:
 

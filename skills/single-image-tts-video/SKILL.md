@@ -62,6 +62,7 @@ When the user sends a music file while making a video, use it as background musi
 - Resolution: `1080x1920`
 - FPS: `25`, matching the reference style used by this workflow.
 - Image fit: fill the frame with a 9:16 crop. Do not add black bars unless the user explicitly asks to preserve the full image.
+- Render frame: after crop preview, render the final MP4 from the cleaned `crop_preview.png` instead of looping the raw uploaded image. This avoids corrupt or oddly encoded PNG uploads producing one-frame/one-second videos.
 - Audio codec: AAC, 192 kbps.
 - BGM default: sidechain ducking on, volume `0.12`, fade in `1.5s`, fade out `3.0s`.
 - Video codec: require H.264 through `libx264` for final MP4 renders. Do not silently fall back to `mpeg4/mp4v` or hardware H.264 for still-image videos; those paths can introduce periodic flicker that survives later editing.
@@ -72,6 +73,7 @@ When the user sends a music file while making a video, use it as background musi
 - ffmpeg path: configured in `config.json`, or pass `--ffmpeg`. Prefer a full system ffmpeg build with `libx264`; the bundled GPT-SoVITS ffmpeg may not include it.
 - ffprobe path: configured in `config.json`, or pass `--ffprobe`.
 - After each final render, inspect the top static region for repeated brightness jumps. If `flicker_check.json` reports `REVIEW`, do not continue editing that MP4 until the preview has been checked or re-rendered.
+- Manual sentence patch preview must stay isolated from the main narration audio. Only applying a candidate may update the main narration player/state, and the apply step must validate that the rebuilt audio is not abnormally short.
 
 If the user requests a horizontal or square video, change `--resolution`.
 
