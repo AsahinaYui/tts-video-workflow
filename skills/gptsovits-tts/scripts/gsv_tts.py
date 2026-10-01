@@ -454,18 +454,40 @@ def prepare_workflow_tts_config(
 ) -> RuntimePaths:
     target = workflow_tts_config_path(runtime_paths.gptsovits_root).resolve()
     source = runtime_paths.tts_config_path.resolve()
-    if source == target:
-        logger.info("Using workflow TTS config already at target: %s", target)
-        return runtime_paths
-    if target.exists():
-        logger.info("Using existing workflow TTS config: %s", target)
-        return with_tts_config_path(runtime_paths, target)
-
     logger.info("Generating workflow TTS config from %s to %s", source, target)
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
-        text = source.read_text(encoding="utf-8")
-        target.write_text(text, encoding="utf-8", newline="\n")
+        text = source.read_text(encoding="utf-8-sig")
+        # The saved voice selection is authoritative, not a previous API run's
+        # custom section (api_v2 writes its last loaded weights back to YAML).
+        overrides = {
+            "t2s_weights_path": runtime_paths.gpt_weights_path.as_posix(),
+            "vits_weights_path": runtime_paths.sovits_weights_path.as_posix(),
+        }
+        version = infer_model_version_from_path(runtime_paths.sovits_weights_path)
+        if version:
+            overrides["version"] = version
+        lines = text.splitlines()
+        start = next((i for i, line in enumerate(lines) if line.strip() == "custom:"), None)
+        if start is None:
+            raise TtsError(f"TTS config does not define a custom section: {source}")
+        end = next(
+            (i for i in range(start + 1, len(lines))
+             if lines[i].strip() and not lines[i].startswith((" ", "\t", "#"))),
+            len(lines),
+        )
+        custom_lines = [
+            line for line in lines[start + 1:end]
+            if line.strip().split(":", 1)[0] not in overrides
+        ]
+        custom_lines.extend(
+            f"  {key}: {json.dumps(value, ensure_ascii=False)}"
+            for key, value in overrides.items()
+        )
+        lines[start + 1:end] = custom_lines
+        text = "\n".join(lines) + "\n"
+        with target.open("w", encoding="utf-8", newline="\n") as stream:
+            stream.write(text)
     except OSError as exc:
         raise TtsError(
             "Failed to generate GPT-SoVITS workflow config at "
