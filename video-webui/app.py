@@ -61,6 +61,9 @@ TEXT_SPLIT_OPTIONS = [
 AUDIO_EXTENSIONS = {".wav", ".mp3", ".flac", ".ogg", ".aac", ".m4a"}
 BASE_MODEL_VALUE = "__use_pretrained_base__"
 BASE_MODEL_LABEL = "不使用模型（底模推理）"
+EMPTY_MODEL_VALUE = "__new_role_preset__"
+EMPTY_MODEL_LABEL = "空（新建角色/不套用预设）"
+EMPTY_REFERENCE_LABEL = "无参考音频（新建/未选择）"
 BROWSER_HEARTBEAT_INTERVAL_SECONDS = 5.0
 BROWSER_UNLOAD_EXIT_DELAY_SECONDS = 20.0
 BROWSER_HEARTBEAT_LOCK = threading.Lock()
@@ -84,6 +87,13 @@ APP_CSS = """
 #video-webui .app-header {
     align-items: end !important;
     gap: 10px !important;
+}
+#video-webui .header-title {
+    flex: 1 1 auto !important;
+}
+#video-webui .header-mode {
+    max-width: 230px !important;
+    min-width: 190px !important;
 }
 #video-webui .main-grid,
 #video-webui .command-bar,
@@ -241,6 +251,13 @@ class AppConfig:
     @property
     def video_script(self) -> Path:
         return resolve_path(str(self.raw["video_script"]), self.path.parent)
+
+    @property
+    def storyboard_script(self) -> Path:
+        raw_script = self.raw.get("storyboard_script")
+        if raw_script:
+            return resolve_path(str(raw_script), self.path.parent)
+        return (self.video_script.parent / "build_storyboard_package.py").resolve()
 
     @property
     def ffmpeg(self) -> Path:
@@ -404,23 +421,124 @@ def ensure_job(config: AppConfig, job_name: str | None = None) -> Path:
     return job
 
 
+def upload_source_path(file_obj: Any) -> Path:
+    if isinstance(file_obj, (str, os.PathLike)):
+        return Path(file_obj)
+    return Path(getattr(file_obj, "name", str(file_obj)))
+
+
 def copy_upload(file_obj: Any, target: Path) -> Path | None:
     if file_obj is None:
         return None
-    source = Path(getattr(file_obj, "name", str(file_obj)))
+    source = upload_source_path(file_obj)
     if not source.exists():
         raise FileNotFoundError(f"Uploaded file does not exist: {source}")
     target.parent.mkdir(parents=True, exist_ok=True)
     if target.suffix == "":
         target = target.with_suffix(source.suffix.lower())
-    shutil.copy2(source, target)
+    if source.resolve() != target.resolve():
+        shutil.copy2(source, target)
     return target.resolve()
+
+
+def current_task_image(job: Path, upload: Any) -> str:
+    if not upload:
+        raise ValueError("请先上传图片。")
+    image = copy_upload(upload, job / "input" / "source_image")
+    return str(image)
+
+
+def copy_upload_many(file_objs: Any, target_dir: Path, prefix: str) -> list[Path]:
+    if not file_objs:
+        return []
+    if not isinstance(file_objs, (list, tuple)):
+        file_objs = [file_objs]
+    target_dir.mkdir(parents=True, exist_ok=True)
+    copied: list[Path] = []
+    for index, file_obj in enumerate(file_objs, start=1):
+        source = upload_source_path(file_obj)
+        if not source.exists():
+            raise FileNotFoundError(f"Uploaded file does not exist: {source}")
+        target = target_dir / f"{prefix}_{index:03d}{source.suffix.lower()}"
+        shutil.copy2(source, target)
+        copied.append(target.resolve())
+    return copied
 
 
 def write_text(path: Path, value: str) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(value or "", encoding="utf-8-sig")
     return path.resolve()
+
+
+def split_storyboard_segment_tokens(value: str) -> list[str]:
+    return [token.strip() for token in re.split(r"[\s,，、;；]+", value or "") if token.strip()]
+
+
+def storyboard_json_from_mapping(mapping_text: str, images: list[Path], default_fit: str) -> dict[str, Any]:
+    if not images:
+        raise ValueError("分镜映射需要至少一张图片。")
+    by_name: dict[str, Path] = {}
+    for index, image in enumerate(images, start=1):
+        by_name[str(index)] = image
+        by_name[image.name.lower()] = image
+        by_name[image.stem.lower()] = image
+
+    shots: list[dict[str, Any]] = []
+    for raw_line in (mapping_text or "").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if ":" in line:
+            left, right = line.split(":", 1)
+        elif "=" in line:
+            left, right = line.split("=", 1)
+        else:
+            raise ValueError(f"分镜映射行缺少 ':' 或 '=': {line}")
+        image = by_name.get(left.strip().lower())
+        if image is None:
+            raise ValueError(f"分镜映射找不到图片: {left.strip()}")
+        segment_tokens = split_storyboard_segment_tokens(right)
+        if not segment_tokens:
+            raise ValueError(f"分镜映射行没有编号: {line}")
+        shots.append(
+            {
+                "id": f"shot_{len(shots) + 1:03d}",
+                "image": str(image),
+                "segments": segment_tokens,
+                "fit": default_fit,
+            }
+        )
+    if not shots:
+        raise ValueError("分镜映射为空。")
+    return {"shots": shots}
+
+
+def normalize_storyboard_json_payload(source: Path, images: list[Path], default_fit: str) -> dict[str, Any]:
+    payload = json.loads(source.read_text(encoding="utf-8-sig"))
+    if isinstance(payload, list):
+        payload = {"shots": payload}
+    if not isinstance(payload, dict):
+        raise ValueError(f"Unsupported storyboard JSON shape: {source}")
+
+    by_name: dict[str, Path] = {}
+    for index, image in enumerate(images, start=1):
+        by_name[str(index)] = image
+        by_name[image.name.lower()] = image
+        by_name[image.stem.lower()] = image
+
+    base_dir = source.parent
+    for item in payload.get("shots") or []:
+        if not isinstance(item, dict):
+            continue
+        raw_image = str(item.get("image") or "").strip()
+        if raw_image:
+            image_path = Path(raw_image)
+            if not image_path.is_absolute():
+                match = by_name.get(raw_image.lower()) or by_name.get(image_path.name.lower()) or by_name.get(image_path.stem.lower())
+                item["image"] = str((match or (base_dir / image_path)).resolve())
+        item.setdefault("fit", default_fit)
+    return payload
 
 
 def process_output_text(value: Any) -> str:
@@ -443,6 +561,21 @@ def config_float(config: AppConfig, key: str, default: float) -> float:
         return float(config.raw.get(key) or default)
     except (TypeError, ValueError):
         return default
+
+
+def write_tts_progress(job: Path, **payload: Any) -> Path:
+    progress_path = job / "logs" / "tts_progress.json"
+    progress_path.parent.mkdir(parents=True, exist_ok=True)
+    current = {}
+    if progress_path.exists():
+        try:
+            current = json.loads(progress_path.read_text(encoding="utf-8-sig"))
+        except Exception:
+            current = {}
+    current.update(payload)
+    current["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    progress_path.write_text(json.dumps(current, ensure_ascii=False, indent=2), encoding="utf-8")
+    return progress_path.resolve()
 
 
 def run_command(command: list[str], cwd: Path, log_path: Path, timeout: int | None = None) -> subprocess.CompletedProcess[str]:
@@ -497,6 +630,7 @@ def require_paths(config: AppConfig) -> list[str]:
         "gsv_tts_script": config.gsv_tts_script,
         "tts_checker_script": config.tts_checker_script,
         "video_script": config.video_script,
+        "storyboard_script": config.storyboard_script,
         "ffmpeg": config.ffmpeg,
         "ffprobe": config.ffprobe,
         "asr_model": config.asr_model,
@@ -509,7 +643,20 @@ def model_label(model: dict[str, Any]) -> str:
     return f"{model.get('name') or model.get('id')} [{model.get('id')}]"
 
 
+def empty_model_template(config: AppConfig) -> dict[str, Any]:
+    base = config.models[0] if config.models else {}
+    return {
+        "id": EMPTY_MODEL_VALUE,
+        "name": EMPTY_MODEL_LABEL,
+        "base_config": base.get("base_config") or "",
+        "default_version": base.get("default_version") or "v2",
+        "use_pretrained_base": False,
+    }
+
+
 def model_by_label(config: AppConfig, label: str) -> dict[str, Any]:
+    if not str(label or "").strip() or str(label or "") == EMPTY_MODEL_LABEL:
+        return empty_model_template(config)
     for model in config.models:
         if model_label(model) == label:
             return model
@@ -664,14 +811,16 @@ def reference_label(asset: dict[str, Any]) -> str:
 
 
 def reference_choices(config: AppConfig) -> list[tuple[str, str]]:
-    return [(reference_label(asset), str(asset.get("id"))) for asset in config.reference_assets]
+    return [(EMPTY_REFERENCE_LABEL, ""), *[(reference_label(asset), str(asset.get("id"))) for asset in config.reference_assets]]
 
 
 def reference_by_id(config: AppConfig, ref_id: str) -> dict[str, Any] | None:
+    if not str(ref_id or "").strip():
+        return None
     for asset in config.reference_assets:
         if str(asset.get("id")) == str(ref_id):
             return asset
-    return config.reference_assets[0] if config.reference_assets else None
+    return None
 
 
 def normalized_path_key(value: Any, base: Path) -> str:
@@ -697,6 +846,8 @@ def model_by_gpt_weights(config: AppConfig, gpt_weights_path: str) -> dict[str, 
 
 
 def default_reference_id(config: AppConfig, model: dict[str, Any]) -> str:
+    if not model or str(model.get("id") or "") == EMPTY_MODEL_VALUE:
+        return ""
     explicit = model.get("reference_id")
     if explicit and reference_by_id(config, str(explicit)):
         return str(explicit)
@@ -704,7 +855,7 @@ def default_reference_id(config: AppConfig, model: dict[str, Any]) -> str:
     for asset in config.reference_assets:
         if audio and str(asset.get("ref_audio_path") or "") == audio:
             return str(asset.get("id"))
-    return str(config.reference_assets[0].get("id")) if config.reference_assets else ""
+    return ""
 
 
 def read_asset_reference_text(config: AppConfig, asset: dict[str, Any] | None) -> str:
@@ -713,7 +864,10 @@ def read_asset_reference_text(config: AppConfig, asset: dict[str, Any] | None) -
     path = resolve_optional_path(asset.get("ref_text_path"), config.path.parent)
     if not path or not path.exists():
         return ""
-    return path.read_text(encoding="utf-8-sig").strip()
+    text = path.read_text(encoding="utf-8-sig").strip()
+    if bool(asset.get("no_ref_text")) and text == "NO_REFERENCE_TEXT_MODE":
+        return ""
+    return text
 
 
 def reference_audio_path_for_asset(config: AppConfig, asset: dict[str, Any] | None) -> Path | None:
@@ -730,6 +884,7 @@ def save_reference_model_preset(
     reference_id: str,
     uploaded_ref_audio: Any,
     reference_text: str,
+    no_ref_text: bool,
     prompt_lang: str,
     text_lang: str,
     text_split_method: str,
@@ -739,6 +894,7 @@ def save_reference_model_preset(
     top_p: float,
     temperature: float,
 ) -> tuple[str, str, str]:
+    default_version = "v2"
     base_mode = is_base_model_choice(gpt_weights_path) or is_base_model_choice(sovits_weights_path)
     if base_mode:
         gpt_path: Path | None = None
@@ -776,7 +932,14 @@ def save_reference_model_preset(
     if not clean_text:
         current_asset = reference_by_id(config, reference_id)
         clean_text = read_asset_reference_text(config, current_asset)
-    if not clean_text:
+    no_ref_text = bool(no_ref_text)
+    if no_ref_text:
+        version_key = default_version.lower() if base_mode else str(sovits_path).lower()
+        if "v3" in version_key or "v4" in version_key:
+            raise ValueError("v3 / v4 vocoder 模型不支持无参考文本模式，请填写参考文本。")
+        if not clean_text:
+            clean_text = "NO_REFERENCE_TEXT_MODE"
+    elif not clean_text:
         raise ValueError("Reference text is empty. Fill it before saving the preset.")
     text_target = write_text(preset_dir / "reference_text.txt", clean_text)
 
@@ -792,6 +955,7 @@ def save_reference_model_preset(
         "ref_audio_path": rel_audio,
         "ref_text_path": rel_text,
         "prompt_lang": prompt_lang or "zh",
+        "no_ref_text": bool(no_ref_text),
     }
     replaced_asset = False
     for index, asset in enumerate(assets):
@@ -810,13 +974,14 @@ def save_reference_model_preset(
         "id": model_id,
         "name": clean_name,
         "base_config": base_config,
-        "default_version": "v2",
+        "default_version": default_version,
         "gpt_weights_path": rel_gpt,
         "sovits_weights_path": rel_sovits,
         "use_pretrained_base": bool(base_mode),
         "reference_id": asset_id,
         "ref_audio_path": rel_audio,
         "ref_text_path": rel_text,
+        "no_ref_text": bool(no_ref_text),
         "prompt_lang": prompt_lang or "zh",
         "text_lang": text_lang or "zh",
         "speed_factor": float(speed_factor),
@@ -1118,17 +1283,23 @@ def parse_srt_blocks(srt_text: str) -> list[dict[str, str]]:
     return blocks
 
 
+def parse_srt_time_range(time_line: str) -> tuple[float, float] | None:
+    match = re.match(
+        r"\s*(\d+:\d+:\d+,\d+)\s*-->\s*(\d+:\d+:\d+,\d+)",
+        time_line or "",
+    )
+    if not match:
+        return None
+    return parse_srt_timestamp(match.group(1)), parse_srt_timestamp(match.group(2))
+
+
 def srt_segments_from_text(srt_text: str) -> list[dict[str, Any]]:
     segments: list[dict[str, Any]] = []
     for fallback_index, block in enumerate(parse_srt_blocks(srt_text), start=1):
-        match = re.match(
-            r"\s*(\d+:\d+:\d+,\d+)\s*-->\s*(\d+:\d+:\d+,\d+)",
-            str(block.get("time") or ""),
-        )
-        if not match:
+        time_range = parse_srt_time_range(str(block.get("time") or ""))
+        if time_range is None:
             continue
-        start = parse_srt_timestamp(match.group(1))
-        end = parse_srt_timestamp(match.group(2))
+        start, end = time_range
         text = str(block.get("text") or "").strip()
         if text and end > start:
             segments.append({"index": fallback_index, "start": start, "end": end, "text": text})
@@ -1862,21 +2033,94 @@ def format_subtitle_block(config: AppConfig, text: str) -> str:
     return "\n".join(wrap_subtitle_text(config, text))
 
 
+def subtitle_page_limits(config: AppConfig) -> tuple[int, int, int]:
+    line_width = config_int(config, "script_subtitle_line_chars", 34)
+    max_lines = max(1, min(2, config_int(config, "script_subtitle_max_lines", 2)))
+    return line_width, max_lines, line_width * max_lines
+
+
+def subtitle_pages_from_block(config: AppConfig, text: str) -> list[str]:
+    line_width, max_lines, page_width = subtitle_page_limits(config)
+    cleaned = strip_subtitle_punctuation((text or "").replace("\r\n", "\n"))
+    if not cleaned:
+        return []
+
+    manual_lines = [line.strip() for line in cleaned.splitlines() if line.strip()]
+    if len(manual_lines) > 1:
+        pages: list[str] = []
+        current: list[str] = []
+        for line in manual_lines:
+            pieces = split_long_subtitle_unit(line, line_width) if text_display_width(line) > line_width else [line]
+            for piece in pieces:
+                if len(current) >= max_lines:
+                    pages.append("\n".join(current))
+                    current = []
+                current.append(piece)
+        if current:
+            pages.append("\n".join(current))
+        return [page for page in pages if normalize_text(page)]
+
+    flat_text = cleaned.replace("\n", "")
+    if text_display_width(flat_text) <= page_width:
+        formatted = format_subtitle_block(config, flat_text)
+        return [formatted] if normalize_text(formatted) else []
+
+    pages = []
+    for chunk in split_long_subtitle_unit(flat_text, page_width):
+        formatted = format_subtitle_block(config, chunk)
+        if normalize_text(formatted):
+            pages.append(formatted)
+    return pages
+
+
+def timed_srt_from_editor_pages(config: AppConfig, srt_text: str, offset_seconds: float = 0.0) -> str:
+    blocks: list[str] = []
+    for block in parse_srt_blocks(srt_text):
+        time_range = parse_srt_time_range(str(block.get("time") or ""))
+        if time_range is None:
+            continue
+        start, end = time_range
+        start += offset_seconds
+        end += offset_seconds
+        if end <= start:
+            continue
+        pages = subtitle_pages_from_block(config, str(block.get("text") or ""))
+        if not pages:
+            continue
+        if len(pages) == 1:
+            blocks.append(make_srt_block(len(blocks) + 1, start, end, pages[0]))
+            continue
+
+        weights = [max(1, len(normalize_text(page))) for page in pages]
+        total = max(1, sum(weights))
+        elapsed = 0.0
+        duration = end - start
+        for page, weight in zip(pages, weights):
+            page_start = start + duration * (elapsed / total)
+            elapsed += weight
+            page_end = start + duration * (elapsed / total)
+            blocks.append(make_srt_block(len(blocks) + 1, page_start, page_end, page))
+    return "\n\n".join(blocks).strip() + ("\n" if blocks else "")
+
+
 def format_srt_for_editor(config: AppConfig, srt_text: str) -> str:
     blocks = parse_srt_blocks(srt_text)
     if not blocks:
         return srt_text or ""
+    if any(str(block.get("time") or "").strip() for block in blocks):
+        formatted = timed_srt_from_editor_pages(config, srt_text)
+        if formatted.strip():
+            return formatted
     output: list[str] = []
     for fallback_index, block in enumerate(blocks, start=1):
-        text = format_subtitle_block(config, str(block.get("text") or ""))
-        if not normalize_text(text):
-            continue
+        pages = subtitle_pages_from_block(config, str(block.get("text") or ""))
         index = str(block.get("index") or fallback_index)
         time_line = str(block.get("time") or "").strip()
-        if time_line:
-            output.append("\n".join([index, time_line, text]))
-        else:
-            output.append(text)
+        for page in pages:
+            if time_line:
+                output.append("\n".join([index, time_line, page]))
+            else:
+                output.append(page)
     return "\n\n".join(output).strip() + ("\n" if output else "")
 
 
@@ -1892,7 +2136,10 @@ def editor_subtitle_blocks(config: AppConfig, editor_text: str) -> list[str]:
             raw_blocks = paragraphs
         else:
             raw_blocks = [line.strip() for line in text.splitlines() if normalize_text(line)]
-    return [format_subtitle_block(config, block) for block in raw_blocks if normalize_text(block)]
+    blocks: list[str] = []
+    for block in raw_blocks:
+        blocks.extend(subtitle_pages_from_block(config, block))
+    return blocks
 
 
 def subtitle_blocks_to_plain_text(blocks: list[str]) -> str:
@@ -1915,8 +2162,10 @@ def final_subtitle_blocks_from_source_or_editor(
     if not source:
         return editor_blocks, "editor"
 
-    if subtitle_text_matches_source(source, editor_blocks):
-        return editor_blocks, "editor_line_breaks"
+    if editor_blocks:
+        if subtitle_text_matches_source(source, editor_blocks):
+            return editor_blocks, "editor_line_breaks"
+        return editor_blocks, "editor_text"
 
     source_blocks = subtitle_blocks_from_script(config, source)
     return source_blocks, "source_text"
@@ -2305,6 +2554,33 @@ def segment_match_report(expected: str, actual: str, pass_cer: float) -> tuple[b
     if too_short:
         detail += ", possible clipping/omission"
     return ok, cer, detail
+
+
+def segment_omission_report(expected: str, actual: str, audio_seconds: float | None = None) -> tuple[str, int, str]:
+    expected_norm = normalize_text(expected)
+    actual_norm = normalize_text(actual)
+    expected_len = len(expected_norm)
+    actual_len = len(actual_norm)
+    shortage = expected_len - actual_len
+    if not expected_norm:
+        return "PASS", 0, "empty expected text"
+    if shortage > 2:
+        status = "RETRY"
+        reason = f"ASR length is shorter by {shortage} chars"
+    elif actual_len == 0:
+        status = "REVIEW"
+        reason = "ASR is empty, but target is too short for a confident omission judgement"
+    else:
+        status = "PASS"
+        reason = "length check passed"
+    detail = (
+        f"omission_status={status}, expected={expected_len} chars, "
+        f"asr={actual_len} chars, shortage={shortage}"
+    )
+    if audio_seconds is not None:
+        detail += f", audio={audio_seconds:.3f}s"
+    detail += f", {reason}"
+    return status, shortage, detail
 
 
 def tts_text_for_attempt(chunk: str, index: int, attempt: int) -> str:
@@ -3225,6 +3501,346 @@ def synthesize_best_chunk_audio(
     return best_audio, report_lines, passed
 
 
+def synthesize_omission_checked_audio(
+    config: AppConfig,
+    job: Path,
+    chunk: str,
+    index: int,
+    voice_config: Path,
+    asr_model: Any,
+    text_lang_value: str,
+    retries: int,
+    patch_root: Path,
+    log_prefix: str,
+    report_label: str,
+    locator: str,
+    total: int,
+    mode: str,
+) -> tuple[Path, list[str], str, str, str]:
+    best_audio: Path | None = None
+    best_status = "RETRY"
+    best_asr = ""
+    best_detail = ""
+    best_rank = 999
+    best_delta = 999
+    report_lines: list[str] = []
+    attempts = tts_attempt_count(index, retries)
+
+    for attempt in range(1, attempts + 1):
+        request_text = tts_text_for_attempt(chunk, index, attempt)
+        write_tts_progress(
+            job,
+            mode=mode,
+            stage="synthesizing",
+            index=index,
+            total=total,
+            locator=locator,
+            attempt=attempt,
+            attempts=attempts,
+            expected=chunk,
+        )
+        text_path = write_text(job / "tmp" / f"{log_prefix}_{index:03d}_try_{attempt:02d}.txt", request_text)
+        out_dir = patch_root / f"{index:03d}" / f"try_{attempt:02d}"
+        log_path = job / "logs" / f"{log_prefix}_{index:03d}_try_{attempt:02d}.txt"
+        audio_path = run_gsv_tts(config, job, text_path, voice_config, out_dir, log_path)
+        audio_seconds = audio_duration_seconds(config, audio_path)
+        asr_text = transcribe_model_to_text(audio_path, asr_model, asr_language(text_lang_value))
+        status, shortage, detail = segment_omission_report(chunk, asr_text, audio_seconds)
+        rank = {"PASS": 0, "REVIEW": 1, "RETRY": 2}.get(status, 2)
+        delta = shortage if shortage > 0 else abs(shortage)
+        if best_audio is None or (rank, delta) < (best_rank, best_delta):
+            best_audio = audio_path
+            best_status = status
+            best_asr = asr_text
+            best_detail = detail
+            best_rank = rank
+            best_delta = delta
+        report_lines.extend(
+            [
+                f"## {report_label} {locator} attempt {attempt:02d}",
+                "",
+                f"- Expected: `{chunk}`",
+                f"- TTS request: `{request_text}`",
+                f"- ASR: `{asr_text}`",
+                f"- Audio: `{audio_path}`",
+                f"- Result: {status} ({detail})",
+                "",
+            ]
+        )
+        write_tts_progress(
+            job,
+            mode=mode,
+            stage="checked",
+            index=index,
+            total=total,
+            locator=locator,
+            attempt=attempt,
+            attempts=attempts,
+            status=status,
+            detail=detail,
+        )
+        if status != "RETRY":
+            return audio_path, report_lines, status, asr_text, detail
+
+    if best_audio is None:
+        raise RuntimeError(f"{report_label} {locator} did not produce audio.")
+    report_lines.extend(
+        [
+            f"### {report_label} {locator} fallback",
+            "",
+            "All attempts still looked shorter than the source text; using the closest attempt and leaving it available for manual repair.",
+            f"- Best status: {best_status}",
+            f"- Best ASR: `{best_asr}`",
+            f"- Detail: {best_detail}",
+            "",
+        ]
+    )
+    return best_audio, report_lines, best_status, best_asr, best_detail
+
+
+def apply_timeline_to_sequence_entries(
+    config: AppConfig,
+    entries: list[dict[str, Any]],
+    pad_seconds: float,
+) -> list[dict[str, Any]]:
+    cursor = 0.0
+    timed_entries: list[dict[str, Any]] = []
+    pad_seconds = max(0.0, min(1.5, float(pad_seconds or 0.0)))
+    for entry in entries:
+        audio_path = Path(str(entry.get("audio") or ""))
+        duration = audio_duration_seconds(config, audio_path) or 0.0
+        start = cursor + pad_seconds
+        end = start + duration
+        item = dict(entry)
+        item["start"] = start
+        item["end"] = end
+        item["duration"] = duration
+        item["timeline_pad_before"] = pad_seconds
+        item["timeline_pad_after"] = pad_seconds
+        timed_entries.append(item)
+        cursor = end + pad_seconds
+    return timed_entries
+
+
+def generate_checked_tts_mode_audio(
+    config: AppConfig,
+    job: Path,
+    text: str,
+    voice_config: Path,
+    text_lang_value: str,
+    mode: str,
+    retries: int,
+    pad_seconds: float,
+) -> tuple[Path, Path, Path, str]:
+    mode = mode if mode in {"stable", "hybrid"} else "stable"
+    if not normalize_text(text or ""):
+        raise ValueError("请先输入旁白文案。")
+
+    from faster_whisper import WhisperModel  # type: ignore
+
+    asr_model = WhisperModel(str(config.asr_model), device="cpu", compute_type="int8")
+    source_path = write_text(job / "input" / "source.txt", text or "")
+    mode_root = job / "tts" / "modes" / mode
+    report_lines = [
+        f"# TTS {mode.title()} Mode Report",
+        "",
+        f"Source: {source_path}",
+        f"Mode: {mode}",
+        f"Retries: {retries}",
+        f"Padding: {pad_seconds:.3f}s",
+        "Omission judgement: retry only when normalized ASR is more than 2 chars shorter than the source segment.",
+        "",
+    ]
+    audio_paths: list[Path] = []
+    entries: list[dict[str, Any]] = []
+    chunks_for_sequence: list[str] = []
+    warning_count = 0
+
+    write_tts_progress(job, mode=mode, stage="started", index=0, total=0, expected="")
+
+    if mode == "stable":
+        units = split_patch_minimal_units(text or "")
+        if not units:
+            raise ValueError("没有可生成的句号/逗号小句。")
+        total = len(units)
+        for sequence_index, unit in enumerate(units, start=1):
+            chunk = str(unit["text"])
+            locator = str(unit["locator"])
+            audio_path, lines, status, asr_text, detail = synthesize_omission_checked_audio(
+                config,
+                job,
+                chunk,
+                sequence_index,
+                voice_config,
+                asr_model,
+                text_lang_value,
+                retries,
+                mode_root / "segments",
+                "tts_stable",
+                "Stable segment",
+                locator,
+                total,
+                mode,
+            )
+            warning_count += 0 if status == "PASS" else 1
+            audio_paths.append(audio_path)
+            chunks_for_sequence.append(chunk)
+            entries.append(
+                {
+                    "kind": "stable_segment",
+                    "chunk_index": sequence_index,
+                    "sentence_index": int(unit["sentence_index"]),
+                    "clause_index": int(unit["clause_index"]),
+                    "locator": locator,
+                    "text": chunk,
+                    "target_norm": normalize_text(chunk),
+                    "audio": str(audio_path),
+                    "tts_mode": mode,
+                    "omission_status": status,
+                    "omission_detail": detail,
+                    "asr": asr_text,
+                }
+            )
+            report_lines.extend(lines)
+    else:
+        sentences = split_patch_sentence_units(text or "")
+        if not sentences:
+            raise ValueError("没有可生成的句号分段。")
+        total = len(sentences)
+        for sentence_index, sentence in enumerate(sentences, start=1):
+            locator = str(sentence_index)
+            audio_path, lines, status, asr_text, detail = synthesize_omission_checked_audio(
+                config,
+                job,
+                sentence,
+                sentence_index,
+                voice_config,
+                asr_model,
+                text_lang_value,
+                retries,
+                mode_root / "sentences",
+                "tts_hybrid_sentence",
+                "Hybrid sentence",
+                locator,
+                total,
+                mode,
+            )
+            report_lines.extend(lines)
+            source_mode = "sentence"
+            clause_statuses: list[str] = []
+            if status == "RETRY":
+                clauses = split_patch_clause_units(sentence)
+                if len(clauses) > 1:
+                    report_lines.extend(
+                        [
+                            f"### Hybrid sentence {locator} clause fallback",
+                            "",
+                            "The sentence-level audio still looked shorter than the source; rebuilding this sentence from comma-level clauses.",
+                            f"- Clauses: {len(clauses)}",
+                            "",
+                        ]
+                    )
+                    clause_audio_paths: list[Path] = []
+                    for clause_index, clause in enumerate(clauses, start=1):
+                        clause_locator = f"{sentence_index}.{clause_index}"
+                        clause_audio, clause_lines, clause_status, _clause_asr, _clause_detail = synthesize_omission_checked_audio(
+                            config,
+                            job,
+                            clause,
+                            clause_index,
+                            voice_config,
+                            asr_model,
+                            text_lang_value,
+                            retries,
+                            mode_root / f"sentence_{sentence_index:03d}_clauses",
+                            f"tts_hybrid_sentence_{sentence_index:03d}_clause",
+                            f"Hybrid sentence {sentence_index} clause",
+                            clause_locator,
+                            len(clauses),
+                            mode,
+                        )
+                        clause_audio_paths.append(clause_audio)
+                        clause_statuses.append(clause_status)
+                        report_lines.extend(clause_lines)
+                    internal_pad = min(0.12, max(0.04, pad_seconds * 0.5 if pad_seconds else 0.08))
+                    audio_path = concat_audio_with_padding(
+                        config,
+                        clause_audio_paths,
+                        mode_root / f"sentence_{sentence_index:03d}_clause_rebuilt.wav",
+                        internal_pad,
+                        job / "logs" / f"tts_hybrid_sentence_{sentence_index:03d}_clause_concat",
+                    )
+                    status = "PASS" if all(item != "RETRY" for item in clause_statuses) else "REVIEW"
+                    source_mode = "clause_rebuild"
+                    detail = f"sentence rebuilt from {len(clauses)} clauses; clause_statuses={','.join(clause_statuses)}"
+            warning_count += 0 if status == "PASS" else 1
+            audio_paths.append(audio_path)
+            chunks_for_sequence.append(sentence)
+            entries.append(
+                {
+                    "kind": "hybrid_sentence",
+                    "chunk_index": sentence_index,
+                    "sentence_index": sentence_index,
+                    "clause_index": 0,
+                    "locator": locator,
+                    "text": sentence,
+                    "target_norm": normalize_text(sentence),
+                    "audio": str(audio_path),
+                    "tts_mode": mode,
+                    "source_mode": source_mode,
+                    "omission_status": status,
+                    "omission_detail": detail,
+                    "asr": asr_text,
+                }
+            )
+
+    final_audio = concat_audio_with_padding(
+        config,
+        audio_paths,
+        job / "tts" / "tts_sentence_patch_applied.wav",
+        pad_seconds,
+        job / "logs" / f"tts_{mode}_concat",
+    )
+    sequence_path = save_audio_sequence(job, chunks_for_sequence, apply_timeline_to_sequence_entries(config, entries, pad_seconds))
+    report_path = job / "checks" / f"tts_{mode}_mode.md"
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_lines.extend(
+        [
+            "## Final Output",
+            "",
+            f"- Audio: `{final_audio}`",
+            f"- Sequence: `{sequence_path}`",
+            f"- Warning segments: {warning_count}",
+            "",
+        ]
+    )
+    report_path.write_text("\n".join(report_lines), encoding="utf-8")
+    write_tts_progress(
+        job,
+        mode=mode,
+        stage="done",
+        index=len(audio_paths),
+        total=len(audio_paths),
+        audio=str(final_audio),
+        sequence=str(sequence_path),
+        report=str(report_path),
+        warnings=warning_count,
+    )
+    message = "\n".join(
+        [
+            f"{'稳定' if mode == 'stable' else '混合策略'}模式 TTS 完成",
+            "自检只按漏句长度判断：ASR 比原分段短超过 2 个规范化字符才触发重试。",
+            "字幕仍以原文案为准；如需要字幕，请继续点击“字幕生成/重排/审核”。",
+            ("存在疑似漏句/需人工复核片段，已保留最佳音频，可继续建立修补分段索引。" if warning_count else "未发现疑似漏句片段。"),
+            f"Audio: {final_audio}",
+            f"Sequence: {sequence_path}",
+            f"Progress: {job / 'logs' / 'tts_progress.json'}",
+            f"Report: {report_path}",
+        ]
+    )
+    return final_audio, sequence_path, report_path, message
+
+
 def synthesize_clause_rebuilt_segment_audio(
     config: AppConfig,
     job: Path,
@@ -3506,7 +4122,9 @@ def prepend_audio_silence(config: AppConfig, source: Path, output: Path, pad_sec
 
 def cut_audio_segment(config: AppConfig, source: Path, output: Path, start: float, end: float, log_path: Path) -> Path:
     start = max(0.0, float(start or 0.0))
-    end = max(start + 0.03, float(end or 0.0))
+    end = float(end or 0.0)
+    if end <= start:
+        raise ValueError("Audio segment end must be after its start.")
     output.parent.mkdir(parents=True, exist_ok=True)
     command = [
         str(config.ffmpeg),
@@ -3806,14 +4424,18 @@ def splice_audio_replace_range(
 
     parts: list[Path] = []
     work_dir.mkdir(parents=True, exist_ok=True)
-    if start > 0.02:
+    if start > 0.0:
         parts.append(cut_audio_segment(config, source, work_dir / "before.wav", 0.0, start, work_dir / "cut_before.txt"))
     parts.append(patch_audio)
-    if duration - end > 0.02:
+    if duration > end:
         parts.append(cut_audio_segment(config, source, work_dir / "after.wav", end, duration, work_dir / "cut_after.txt"))
-    boundary_report.update({"final_start": start, "final_end": end, "crossfade_seconds": manual_patch_crossfade_seconds(config)})
+    # Speech replacements must preserve the complete candidate and the exact
+    # timeline used by the patch index. Overlapping fades attenuate its onset
+    # and shorten every join without a corresponding change to the index.
+    boundary_report.update({"final_start": start, "final_end": end, "crossfade_seconds": 0.0,
+                            "join_mode": "preserve_samples"})
     (work_dir / "splice_boundaries.json").write_text(json.dumps(boundary_report, ensure_ascii=False, indent=2), encoding="utf-8")
-    return concat_audio_with_crossfade(config, parts, output, manual_patch_crossfade_seconds(config), work_dir / "concat")
+    return concat_audio_with_padding(config, parts, output, 0.0, work_dir / "concat")
 
 
 def shift_srt_timestamps(srt_text: str, offset_seconds: float) -> str:
@@ -3838,16 +4460,22 @@ def render_srt_from_editor(config: AppConfig, audio_path: Path, editor_text: str
     if not text:
         return ""
     if "-->" in text:
-        return shift_srt_timestamps(text, offset_seconds) if offset_seconds > 0 else text.strip() + "\n"
+        formatted = timed_srt_from_editor_pages(config, text, offset_seconds)
+        return formatted if formatted.strip() else (shift_srt_timestamps(text, offset_seconds) if offset_seconds > 0 else text.strip() + "\n")
     pages = editor_subtitle_pages_preserve_lines(text)
     if not pages:
         return ""
     duration = audio_duration_seconds(config, audio_path) or float(len(pages))
     duration = max(0.1, duration)
     blocks: list[str] = []
-    for index, page in enumerate(pages, start=1):
-        start = offset_seconds + duration * ((index - 1) / len(pages))
-        end = offset_seconds + (duration if index == len(pages) else duration * (index / len(pages)))
+    formatted_pages: list[str] = []
+    for page in pages:
+        formatted_pages.extend(subtitle_pages_from_block(config, page))
+    if not formatted_pages:
+        return ""
+    for index, page in enumerate(formatted_pages, start=1):
+        start = offset_seconds + duration * ((index - 1) / len(formatted_pages))
+        end = offset_seconds + (duration if index == len(formatted_pages) else duration * (index / len(formatted_pages)))
         blocks.append(make_srt_block(index, start, end, page))
     return "\n\n".join(blocks).strip() + "\n"
 
@@ -3855,24 +4483,24 @@ def render_srt_from_editor(config: AppConfig, audio_path: Path, editor_text: str
 def create_ui(config: AppConfig):
     import gradio as gr  # type: ignore
 
-    labels = [model_label(model) for model in config.models]
-    default_label = labels[0] if labels else None
+    labels = [EMPTY_MODEL_LABEL, *[model_label(model) for model in config.models]]
+    default_label = EMPTY_MODEL_LABEL
     default_model = config.models[0] if config.models else {}
     gpt_choices = file_choices(config, gpt_weight_files(config))
     sovits_choices = file_choices(config, sovits_weight_files(config))
     default_gpt = existing_weight_or_first(config, default_model.get("gpt_weights_path"), gpt_choices)
     default_sovits = existing_weight_or_first(config, default_model.get("sovits_weights_path"), sovits_choices)
     ref_choices = reference_choices(config)
-    default_ref_id = default_reference_id(config, default_model) if default_model else ""
-    default_ref_text = read_asset_reference_text(config, reference_by_id(config, default_ref_id))
-    default_prompt_lang = str(model_setting(config, default_model, "prompt_lang", "zh"))
-    default_text_lang = str(model_setting(config, default_model, "text_lang", "zh"))
-    default_split = str(model_setting(config, default_model, "text_split_method", "cut1"))
-    default_speed = float(model_setting(config, default_model, "speed_factor", 1.0))
-    default_fragment = float(model_setting(config, default_model, "fragment_interval", 0.3))
-    default_top_k = int(model_setting(config, default_model, "top_k", 15))
-    default_top_p = float(model_setting(config, default_model, "top_p", 1.0))
-    default_temperature = float(model_setting(config, default_model, "temperature", 1.0))
+    default_ref_id = ""
+    default_ref_text = ""
+    default_prompt_lang = "zh"
+    default_text_lang = "zh"
+    default_split = "cut1"
+    default_speed = 1.0
+    default_fragment = 0.3
+    default_top_k = 15
+    default_top_p = 1.0
+    default_temperature = 1.0
     agent_cfg = config.raw.get("agent_review", {}) if isinstance(config.raw.get("agent_review", {}), dict) else {}
     default_review_mode = str(agent_cfg.get("mode") or "local")
     default_agent_url = str(agent_cfg.get("api_url") or "")
@@ -3884,7 +4512,19 @@ def create_ui(config: AppConfig):
         browser_heartbeat_state = gr.Textbox(value="", visible=False)
         browser_heartbeat_timer = gr.Timer(value=BROWSER_HEARTBEAT_INTERVAL_SECONDS, active=True)
         with gr.Row(elem_classes=["app-header"]):
-            gr.Markdown("# Local TTS Video Studio")
+            with gr.Column(scale=1, min_width=0, elem_classes=["header-title"]):
+                gr.Markdown("# Local TTS Video Studio")
+            with gr.Column(scale=1, min_width=190, elem_classes=["header-mode"]):
+                tts_mode = gr.Dropdown(
+                    choices=[
+                        ("Hybrid", "hybrid"),
+                        ("Stable", "stable"),
+                        ("Quick", "quick"),
+                    ],
+                    value="hybrid",
+                    label="TTS 模式",
+                    interactive=True,
+                )
 
         job_state = gr.State("")
         image_state = gr.State("")
@@ -3986,10 +4626,10 @@ def create_ui(config: AppConfig):
                         with gr.Row(elem_classes=["dense-row"]):
                             crop_x = gr.Slider(0.0, 1.0, value=0.5, step=0.01, label="裁切 X")
                             crop_y = gr.Slider(0.0, 1.0, value=0.5, step=0.01, label="裁切 Y")
-                            auto_chunk_chars = gr.Slider(30, 180, value=45, step=5, label="自动修复分段字数")
-                            auto_retries = gr.Slider(0, 4, value=2, step=1, label="失败片段重试次数")
+                            auto_chunk_chars = gr.Slider(30, 180, value=45, step=5, label="索引/旧流程分段字数")
+                            auto_retries = gr.Slider(0, 4, value=2, step=1, label="生成重试次数")
                         with gr.Row(elem_classes=["dense-row"]):
-                            auto_pass_cer = gr.Slider(0.02, 0.30, value=0.14, step=0.01, label="ASR 通过 CER")
+                            auto_pass_cer = gr.Slider(0.02, 0.30, value=0.14, step=0.01, label="人工候选 CER")
                             auto_pad_ms = gr.Slider(0, 800, value=160, step=20, label="片段首尾静音 ms")
 
             with gr.Column(scale=4):
@@ -4062,13 +4702,57 @@ def create_ui(config: AppConfig):
             rendered_video_path = gr.Textbox(value="", visible=False)
             output_dir = gr.Textbox(label="当前任务目录")
 
+        with gr.Accordion("Storyboard / 分镜素材包导出", open=False):
+            storyboard_images = gr.File(
+                label="分镜图片（可多选，按上传顺序或映射表使用）",
+                file_types=["image"],
+                file_count="multiple",
+            )
+            storyboard_json_file = gr.File(label="Storyboard JSON（可选）", file_types=[".json"])
+            segment_id_map_file = gr.File(label="段号映射 JSON/CSV/TXT（可选，用于 1.1 / 1.2 这类编号）")
+            storyboard_mapping = gr.Textbox(
+                label="快速映射（可选）",
+                placeholder="1: 1.1,1.2\n2: 2.1,2.2\n3: 2.3",
+                lines=5,
+            )
+            with gr.Row(elem_classes=["dense-row"]):
+                storyboard_subtitle_mode = gr.Dropdown(
+                    ["off", "sidecar", "burn"],
+                    value="off",
+                    label="字幕模式",
+                    scale=1,
+                )
+                storyboard_fit = gr.Dropdown(["crop", "pad"], value="crop", label="图片适配", scale=1)
+                storyboard_render_preview = gr.Checkbox(label="同时渲染预览 MP4", value=False, scale=1)
+            with gr.Row(elem_classes=["dense-row"]):
+                btn_storyboard_export = gr.Button("导出分镜素材包", variant="primary", scale=1)
+                storyboard_package_dir = gr.Textbox(label="分镜素材包目录", scale=3)
+
         def on_model_preset_change(label: str):
             try:
-                selected = model_by_label(config, label)
                 current_gpt_choices = file_choices(config, gpt_weight_files(config))
                 current_sovits_choices = file_choices(config, sovits_weight_files(config))
+                if str(label or "") == EMPTY_MODEL_LABEL:
+                    return (
+                        gr.update(choices=current_gpt_choices),
+                        gr.update(choices=current_sovits_choices),
+                        gr.update(value=""),
+                        gr.update(value=None),
+                        "",
+                        False,
+                        "zh",
+                        "zh",
+                        "cut1",
+                        1.0,
+                        0.3,
+                        15,
+                        1.0,
+                        1.0,
+                    )
+                selected = model_by_label(config, label)
                 ref_id = default_reference_id(config, selected)
                 ref_asset = reference_by_id(config, ref_id)
+                selected_no_ref_text = bool(selected.get("no_ref_text") or (ref_asset and ref_asset.get("no_ref_text")))
                 return (
                     gr.update(
                         choices=current_gpt_choices,
@@ -4079,7 +4763,9 @@ def create_ui(config: AppConfig):
                         value=existing_weight_or_first(config, selected.get("sovits_weights_path"), current_sovits_choices),
                     ),
                     gr.update(value=ref_id),
+                    gr.update(value=None),
                     read_asset_reference_text(config, ref_asset),
+                    selected_no_ref_text,
                     str(model_setting(config, selected, "prompt_lang", ref_asset.get("prompt_lang", "zh") if ref_asset else "zh")),
                     str(model_setting(config, selected, "text_lang", "zh")),
                     str(model_setting(config, selected, "text_split_method", "cut1")),
@@ -4094,7 +4780,9 @@ def create_ui(config: AppConfig):
                     gr.update(),
                     gr.update(),
                     gr.update(),
+                    gr.update(value=None),
                     "",
+                    False,
                     "zh",
                     "zh",
                     "cut1",
@@ -4108,23 +4796,26 @@ def create_ui(config: AppConfig):
         def on_reference_preset_change(ref_id: str):
             asset = reference_by_id(config, ref_id)
             if not asset:
-                return "", "zh"
-            return read_asset_reference_text(config, asset), str(asset.get("prompt_lang") or "zh")
+                return "", False, "zh", gr.update(value=None)
+            return read_asset_reference_text(config, asset), bool(asset.get("no_ref_text")), str(asset.get("prompt_lang") or "zh"), gr.update(value=None)
 
         def on_gpt_weights_change(gpt_weights_value: str):
             if is_base_model_choice(gpt_weights_value):
                 return (
+                    gr.update(value=EMPTY_MODEL_LABEL),
                     gr.update(choices=file_choices(config, sovits_weight_files(config)), value=BASE_MODEL_VALUE),
-                    gr.update(),
-                    gr.update(),
-                    gr.update(),
-                    gr.update(),
-                    gr.update(),
-                    gr.update(),
-                    gr.update(),
-                    gr.update(),
-                    gr.update(),
-                    gr.update(),
+                    gr.update(value=""),
+                    gr.update(value=None),
+                    "",
+                    False,
+                    "zh",
+                    "zh",
+                    "cut1",
+                    1.0,
+                    0.3,
+                    15,
+                    1.0,
+                    1.0,
                     "已切换到底模推理：将跳过自定义 GPT / SoVITS 权重，只使用参考音频和参考文本。",
                 )
             matched = model_by_gpt_weights(config, gpt_weights_value)
@@ -4132,26 +4823,33 @@ def create_ui(config: AppConfig):
             current_sovits_choices = file_choices(config, sovits_weight_files(config))
             if not matched:
                 return (
+                    gr.update(value=EMPTY_MODEL_LABEL),
                     gr.update(value=str(matched_sovits)) if matched_sovits else gr.update(),
-                    gr.update(),
-                    gr.update(),
-                    gr.update(),
-                    gr.update(),
-                    gr.update(),
-                    gr.update(),
-                    gr.update(),
-                    gr.update(),
-                    gr.update(),
-                    gr.update(),
-                    "未找到与当前 GPT weights 绑定的参考模型预设",
+                    gr.update(value=""),
+                    gr.update(value=None),
+                    "",
+                    False,
+                    "zh",
+                    "zh",
+                    "cut1",
+                    1.0,
+                    0.3,
+                    15,
+                    1.0,
+                    1.0,
+                    "未找到与当前 GPT weights 绑定的参考模型预设；已切到空角色并清空参考音频，保存新预设前请先选择或上传正确参考音频。",
                 )
             ref_id = default_reference_id(config, matched)
             ref_asset = reference_by_id(config, ref_id)
             sovits_value = matched_sovits or resolve_optional_weight_path(config, matched.get("sovits_weights_path"))
+            matched_no_ref_text = bool(matched.get("no_ref_text") or (ref_asset and ref_asset.get("no_ref_text")))
             return (
+                gr.update(value=model_label(matched)),
                 gr.update(value=existing_weight_or_first(config, str(sovits_value) if sovits_value else "", current_sovits_choices)),
                 gr.update(value=ref_id),
+                gr.update(value=None),
                 read_asset_reference_text(config, ref_asset),
+                matched_no_ref_text,
                 str(model_setting(config, matched, "prompt_lang", ref_asset.get("prompt_lang", "zh") if ref_asset else "zh")),
                 str(model_setting(config, matched, "text_lang", "zh")),
                 str(model_setting(config, matched, "text_split_method", "cut1")),
@@ -4164,8 +4862,9 @@ def create_ui(config: AppConfig):
             )
 
         def save_current_model_preset(*values: Any):
-            if len(values) != 14:
+            if len(values) != 15:
                 return (
+                    gr.update(),
                     gr.update(),
                     gr.update(),
                     gr.update(),
@@ -4179,6 +4878,7 @@ def create_ui(config: AppConfig):
                 sovits_weights_value,
                 reference_id_value,
                 ref_audio_upload,
+                no_ref_text_value,
                 reference_text_value,
                 prompt_lang_value,
                 text_lang_value,
@@ -4198,6 +4898,7 @@ def create_ui(config: AppConfig):
                     reference_id_value,
                     ref_audio_upload,
                     reference_text_value,
+                    bool(no_ref_text_value),
                     prompt_lang_value,
                     text_lang_value,
                     text_split_value,
@@ -4207,7 +4908,7 @@ def create_ui(config: AppConfig):
                     top_p_value,
                     temperature_value,
                 )
-                current_labels = [model_label(item) for item in config.models]
+                current_labels = [EMPTY_MODEL_LABEL, *[model_label(item) for item in config.models]]
                 current_gpt_choices = file_choices(config, gpt_weight_files(config))
                 current_sovits_choices = file_choices(config, sovits_weight_files(config))
                 current_ref_choices = reference_choices(config)
@@ -4219,11 +4920,13 @@ def create_ui(config: AppConfig):
                     gr.update(choices=current_gpt_choices, value=saved_gpt_value),
                     gr.update(choices=current_sovits_choices, value=saved_sovits_value),
                     gr.update(choices=current_ref_choices, value=ref_id),
+                    bool(no_ref_text_value),
                     saved_text,
                     message,
                 )
             except Exception:
                 return (
+                    gr.update(),
                     gr.update(),
                     gr.update(),
                     gr.update(),
@@ -4313,6 +5016,7 @@ def create_ui(config: AppConfig):
 
         def generate_tts(
             job_value: str,
+            tts_mode_value: str,
             label: str,
             text: str,
             gpt_weights_value: str,
@@ -4329,13 +5033,20 @@ def create_ui(config: AppConfig):
             top_k_value: float,
             top_p_value: float,
             temperature_value: float,
+            retries_value: float,
+            pad_ms_value: float,
         ):
             try:
                 if not job_value:
                     raise ValueError("请先点击“准备任务”。")
+                if not (text or "").strip():
+                    raise ValueError("请先输入旁白文案。")
                 job = Path(job_value)
                 selected = model_by_label(config, label)
                 text_path = write_text(job / "input" / "source.txt", text or "")
+                tts_mode_current = str(tts_mode_value or "hybrid").strip().lower()
+                if tts_mode_current not in {"quick", "stable", "hybrid"}:
+                    tts_mode_current = "hybrid"
                 overrides = build_tts_overrides(
                     config,
                     job,
@@ -4355,13 +5066,34 @@ def create_ui(config: AppConfig):
                     top_p_value,
                     temperature_value,
                 )
-                voice_config = merge_voice_config(config, selected, job / "tmp" / "voice_config.json", overrides)
-                out_dir = job / "tts"
-                audio_path = run_gsv_tts(config, job, text_path, voice_config, out_dir, job / "logs" / "tts.txt")
+                voice_config = merge_voice_config(config, selected, job / "tmp" / f"voice_config.{tts_mode_current}.json", overrides)
+                if tts_mode_current == "quick":
+                    write_tts_progress(job, mode=tts_mode_current, stage="synthesizing", index=1, total=1, expected=text or "")
+                    out_dir = job / "tts"
+                    audio_path = run_gsv_tts(config, job, text_path, voice_config, out_dir, job / "logs" / "tts.txt")
+                    write_tts_progress(job, mode=tts_mode_current, stage="done", index=1, total=1, audio=str(audio_path))
+                    return (
+                        str(audio_path),
+                        str(audio_path),
+                        f"快速模式 TTS 完成\nAudio: {audio_path}\nVoice config: {voice_config}\nLog: {job / 'logs' / 'tts.txt'}\nProgress: {job / 'logs' / 'tts_progress.json'}",
+                    )
+
+                retries = max(0, min(4, int(retries_value or 0)))
+                pad_seconds = max(0.0, min(0.8, float(pad_ms_value or 0.0) / 1000.0))
+                audio_path, _sequence_path, _report_path, message = generate_checked_tts_mode_audio(
+                    config,
+                    job,
+                    text or "",
+                    voice_config,
+                    text_lang_value,
+                    tts_mode_current,
+                    retries,
+                    pad_seconds,
+                )
                 return (
                     str(audio_path),
                     str(audio_path),
-                    f"TTS 完成\nAudio: {audio_path}\nVoice config: {voice_config}\nLog: {job / 'logs' / 'tts.txt'}",
+                    message + f"\nVoice config: {voice_config}",
                 )
             except Exception:
                 return None, "", traceback.format_exc()
@@ -4521,6 +5253,7 @@ def create_ui(config: AppConfig):
                 if not image_value:
                     raise ValueError("请先上传图片。")
                 job = Path(job_value)
+                image_value = current_task_image(job, image_value)
                 output = job / "input" / "crop_preview.png"
                 command = [
                     str(config.python_exe),
@@ -5563,6 +6296,7 @@ def create_ui(config: AppConfig):
                 indexed_by_locator = any("sentence_index" in entry and "clause_index" in entry for entry in entries)
                 direct_splice_audio: Path | None = None
                 splice_report_path: Path | None = None
+                expected_duration_after: float | None = None
 
                 if indexed_by_locator:
                     target_units = [
@@ -5737,16 +6471,13 @@ def create_ui(config: AppConfig):
                         target_set = set(target_entry_indexes)
                         first_target_entry = entries[target_entry_indexes[0]]
 
-                        # Direct time-range splicing is too risky for hand repairs:
-                        # a slightly wrong ASR boundary can cut into neighboring clauses.
-                        # Rebuild from the patch index instead so preview candidates
-                        # cannot swallow unrelated audio when applied.
-                        allow_direct_splice = False
-                        if allow_direct_splice and current_source.exists() and len(timed_target_entries) == len(target_entries):
+                        # Replace only the target slot in the current full audio.
+                        # Rebuilding the entire file from pre-cut ASR chunks can
+                        # expose unrelated bad cuts, such as chopping the final
+                        # sentence when only a middle clause was repaired.
+                        if current_source.exists() and len(timed_target_entries) == len(target_entries):
                             raw_splice_start = min(float(entry["start"]) for entry in timed_target_entries)
                             raw_splice_end = max(float(entry["end"]) for entry in timed_target_entries)
-                            splice_start = raw_splice_start
-                            splice_end = raw_splice_end
                             previous_entries = [
                                 entry
                                 for index, entry in enumerate(entries[: min(target_entry_indexes)])
@@ -5757,29 +6488,24 @@ def create_ui(config: AppConfig):
                                 for index, entry in enumerate(entries[max(target_entry_indexes) + 1 :], start=max(target_entry_indexes) + 1)
                                 if index not in target_set and entry.get("start") is not None
                             ]
-                            search_seconds = manual_patch_boundary_search_seconds(config)
-                            neighbor_bleed = manual_patch_neighbor_bleed_seconds(config)
                             previous_end = float(previous_entries[-1]["end"]) if previous_entries else None
                             next_start = float(next_entries[0]["start"]) if next_entries else None
-                            if previous_entries:
-                                splice_start = max(splice_start, float(previous_end) - neighbor_bleed)
-                            if next_entries:
-                                splice_end = min(splice_end, float(next_start) + neighbor_bleed)
-                            if splice_end <= splice_start:
+                            current_duration = audio_duration_seconds(config, current_source) or raw_splice_end
+                            current_duration = max(current_duration, raw_splice_end)
+                            # ASR can place the first timestamp inside the first
+                            # syllable. Replacing the first slot must also remove
+                            # the unindexed lead-in, not leave a fragment of it.
+                            splice_start = previous_end if previous_end is not None else 0.0
+                            splice_end = next_start if next_start is not None else current_duration
+                            splice_start = max(0.0, min(current_duration, splice_start))
+                            splice_end = max(0.0, min(current_duration, splice_end))
+                            if splice_end <= splice_start + 0.04:
+                                protected_end = raw_splice_end
+                                if next_start is not None:
+                                    protected_end = min(protected_end, next_start)
+                                splice_end = max(splice_start + 0.05, min(current_duration, protected_end))
+                            if splice_end <= splice_start + 0.04:
                                 raise ValueError("替换区间被相邻编号保护夹空，请重新建立修补分段索引或改用更大的编号范围。")
-                            current_duration = audio_duration_seconds(config, current_source) or max(splice_end, raw_splice_end)
-                            start_search = (
-                                max(0.0, min(raw_splice_start, splice_start) - search_seconds),
-                                min(splice_end - 0.05, max(raw_splice_start, splice_start) + search_seconds),
-                            )
-                            end_search = (
-                                max(splice_start + 0.05, min(raw_splice_end, splice_end) - search_seconds),
-                                min(current_duration, max(raw_splice_end, splice_end) + search_seconds),
-                            )
-                            if previous_end is not None:
-                                start_search = (max(start_search[0], previous_end - neighbor_bleed), start_search[1])
-                            if next_start is not None:
-                                end_search = (end_search[0], min(end_search[1], next_start + neighbor_bleed))
                             direct_splice_audio = splice_audio_replace_range(
                                 config,
                                 current_source,
@@ -5788,8 +6514,8 @@ def create_ui(config: AppConfig):
                                 splice_start,
                                 splice_end,
                                 job / "logs" / "sentence_patch_direct_splice",
-                                start_search=start_search,
-                                end_search=end_search,
+                                start_search=(splice_start, splice_start),
+                                end_search=(splice_end, splice_end),
                             )
                             splice_report_path = job / "logs" / "sentence_patch_direct_splice" / "splice_boundaries.json"
                             if splice_report_path.exists():
@@ -5801,6 +6527,7 @@ def create_ui(config: AppConfig):
                                     pass
                             original_span = max(0.001, splice_end - splice_start)
                             patch_duration = audio_duration_seconds(config, final_patch_audio) or original_span
+                            expected_duration_after = max(0.0, current_duration - original_span + patch_duration)
                             delta = patch_duration - original_span
                             replacement_entry = {
                                 "kind": "patch",
@@ -5936,6 +6663,13 @@ def create_ui(config: AppConfig):
                     )
                 if patch_duration_before and final_duration_after and final_duration_after < patch_duration_before * 0.8:
                     raise RuntimeError("应用后的音频比候选单句还短，已停止更新主音频。")
+                if expected_duration_after and final_duration_after:
+                    tolerance = max(0.35, expected_duration_after * 0.03)
+                    if abs(final_duration_after - expected_duration_after) > tolerance:
+                        raise RuntimeError(
+                            "应用后的音频时长与替换槽位不匹配，已停止更新主音频。"
+                            f" 预期约 {expected_duration_after:.2f}s，结果 {final_duration_after:.2f}s。"
+                        )
                 if final_audio.resolve() != stable_apply_audio.resolve():
                     stable_apply_audio.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copy2(final_audio, stable_apply_audio)
@@ -6002,6 +6736,7 @@ def create_ui(config: AppConfig):
                 if not audio_value:
                     raise ValueError("请先生成或上传旁白音频。")
                 job = Path(job_value)
+                image_value = current_task_image(job, image_value)
                 text_path = write_text(job / "input" / "source.txt", text or "")
                 head_pad_ms = max(0, min(1000, config_int(config, "render_audio_head_pad_ms", 200)))
                 head_pad_seconds = head_pad_ms / 1000.0
@@ -6024,11 +6759,14 @@ def create_ui(config: AppConfig):
                         srt_text or "",
                     )
                     if srt_text.strip() and "-->" in srt_text:
-                        timing_segments = srt_segments_from_text(srt_text)
-                        if timing_segments:
-                            srt_for_render = script_aligned_srt_from_blocks(config, audio_for_timing, timing_segments, final_blocks)
+                        if subtitle_source_mode.startswith("editor"):
+                            srt_for_render = render_srt_from_editor(config, audio_for_timing, srt_text, 0.0)
                         else:
-                            srt_for_render = render_srt_from_editor(config, audio_for_timing, "\n\n".join(final_blocks), 0.0)
+                            timing_segments = srt_segments_from_text(srt_text)
+                            if timing_segments:
+                                srt_for_render = script_aligned_srt_from_blocks(config, audio_for_timing, timing_segments, final_blocks)
+                            else:
+                                srt_for_render = render_srt_from_editor(config, audio_for_timing, "\n\n".join(final_blocks), 0.0)
                     else:
                         srt_for_render = render_srt_from_editor(config, audio_for_timing, "\n\n".join(final_blocks), 0.0)
                     if head_pad_seconds > 0:
@@ -6098,6 +6836,136 @@ def create_ui(config: AppConfig):
             except Exception:
                 return None, "", "", traceback.format_exc()
 
+        def export_storyboard_package(
+            job_value: str,
+            image_value: str,
+            audio_value: str,
+            images: Any,
+            storyboard_json_upload: Any,
+            segment_id_map_upload: Any,
+            mapping_text: str,
+            subtitle_mode_value: str,
+            fit_value: str,
+            render_preview_value: bool,
+            crop_x_value: float,
+            crop_y_value: float,
+        ):
+            try:
+                job_text = str(job_value or "").strip()
+                if not job_text:
+                    raise RuntimeError("请先准备任务，并至少完成一次分段 TTS。")
+                job = Path(job_text).resolve()
+                if not job.exists() or not job.is_dir():
+                    raise RuntimeError("请先准备任务，并至少完成一次分段 TTS。")
+
+                subtitle_mode = str(subtitle_mode_value or "off").strip()
+                if subtitle_mode not in {"off", "sidecar", "burn"}:
+                    subtitle_mode = "off"
+                fit = str(fit_value or "crop").strip()
+                if fit not in {"crop", "pad"}:
+                    fit = "crop"
+
+                input_dir = job / "storyboard" / "inputs"
+                image_input_dir = input_dir / "images"
+                copied_images = copy_upload_many(images, image_input_dir, "storyboard_image")
+                if not copied_images and image_value:
+                    current_image = Path(current_task_image(job, image_value))
+                    if current_image.exists() and current_image.is_file():
+                        copied = copy_upload(str(current_image), image_input_dir / "storyboard_image_001")
+                        if copied:
+                            copied_images.append(copied)
+
+                command = [
+                    str(config.python_exe),
+                    str(config.storyboard_script),
+                    "--webui-job",
+                    str(job),
+                    "--output-dir",
+                    str(job / "storyboard"),
+                    "--name",
+                    "package",
+                    "--subtitle-mode",
+                    subtitle_mode,
+                    "--fit",
+                    fit,
+                    "--crop-x",
+                    str(float(crop_x_value or 0.5)),
+                    "--crop-y",
+                    str(float(crop_y_value or 0.5)),
+                    "--ffmpeg",
+                    str(config.ffmpeg),
+                    "--ffprobe",
+                    str(config.ffprobe),
+                ]
+
+                audio_text = str(audio_value or "").strip()
+                if audio_text:
+                    audio_path = Path(audio_text)
+                    if audio_path.exists() and audio_path.is_file():
+                        command.extend(["--audio", str(audio_path)])
+
+                storyboard_path: Path | None = None
+                if storyboard_json_upload:
+                    uploaded_storyboard = copy_upload(storyboard_json_upload, input_dir / "storyboard")
+                    if uploaded_storyboard:
+                        payload = normalize_storyboard_json_payload(uploaded_storyboard, copied_images, fit)
+                        storyboard_path = write_text(
+                            input_dir / "storyboard.normalized.json",
+                            json.dumps(payload, ensure_ascii=False, indent=2),
+                        )
+                elif str(mapping_text or "").strip():
+                    payload = storyboard_json_from_mapping(mapping_text, copied_images, fit)
+                    storyboard_path = write_text(
+                        input_dir / "storyboard.from_mapping.json",
+                        json.dumps(payload, ensure_ascii=False, indent=2),
+                    )
+
+                if storyboard_path:
+                    command.extend(["--storyboard", str(storyboard_path)])
+                elif copied_images:
+                    for image in copied_images:
+                        command.extend(["--image", str(image)])
+
+                segment_id_map_path = copy_upload(segment_id_map_upload, input_dir / "segment_id_map") if segment_id_map_upload else None
+                if segment_id_map_path:
+                    command.extend(["--segment-id-map", str(segment_id_map_path)])
+
+                if render_preview_value:
+                    command.append("--render-preview")
+
+                result = run_command(
+                    command,
+                    config.project_root,
+                    job / "logs" / "storyboard_export.txt",
+                    timeout=config_int(config, "storyboard_timeout_seconds", 1800),
+                )
+                if result.returncode != 0:
+                    raise RuntimeError(result.stderr[-3000:] or result.stdout[-3000:])
+
+                manifest = parse_json_from_stdout(result.stdout)
+                package_dir = Path(str(manifest.get("package") or job / "storyboard" / "package")).resolve()
+                preview_text = str(manifest.get("preview") or "").strip()
+                preview_path = Path(preview_text) if preview_text else None
+                preview_exists = bool(preview_path and preview_path.exists() and preview_path.is_file())
+                preview_value: Any = str(preview_path) if preview_exists else gr.update()
+                warnings = [str(value) for value in manifest.get("warnings") or []]
+                status_lines = [
+                    "分镜素材包已导出",
+                    f"Package: {package_dir}",
+                    f"Timeline: {manifest.get('timeline')}",
+                    f"Segments CSV: {manifest.get('segments_csv')}",
+                    f"Shots CSV: {manifest.get('shots_csv')}",
+                    f"Markers CSV: {manifest.get('markers_csv')}",
+                    f"Preview: {preview_path if preview_exists else 'not rendered'}",
+                    f"Log: {job / 'logs' / 'storyboard_export.txt'}",
+                ]
+                if warnings:
+                    status_lines.append("Warnings:")
+                    status_lines.extend(f"- {warning}" for warning in warnings)
+                return preview_value, "\n".join(status_lines), str(package_dir)
+            except Exception:
+                return gr.update(), traceback.format_exc(), ""
+
         btn_prepare.click(
             prepare_job,
             inputs=[job_name, image_file, uploaded_audio, uploaded_srt, source_text],
@@ -6122,7 +6990,9 @@ def create_ui(config: AppConfig):
                 gpt_weights,
                 sovits_weights,
                 reference_preset,
+                ref_audio_file,
                 reference_text,
+                no_ref_text,
                 prompt_lang,
                 text_lang,
                 text_split_method,
@@ -6137,9 +7007,12 @@ def create_ui(config: AppConfig):
             on_gpt_weights_change,
             inputs=[gpt_weights],
             outputs=[
+                model,
                 sovits_weights,
                 reference_preset,
+                ref_audio_file,
                 reference_text,
+                no_ref_text,
                 prompt_lang,
                 text_lang,
                 text_split_method,
@@ -6159,6 +7032,7 @@ def create_ui(config: AppConfig):
                 sovits_weights,
                 reference_preset,
                 ref_audio_file,
+                no_ref_text,
                 reference_text,
                 prompt_lang,
                 text_lang,
@@ -6174,6 +7048,7 @@ def create_ui(config: AppConfig):
                 gpt_weights,
                 sovits_weights,
                 reference_preset,
+                no_ref_text,
                 reference_text,
                 status,
             ],
@@ -6195,7 +7070,7 @@ def create_ui(config: AppConfig):
         reference_preset.change(
             on_reference_preset_change,
             inputs=[reference_preset],
-            outputs=[reference_text, prompt_lang],
+            outputs=[reference_text, no_ref_text, prompt_lang, ref_audio_file],
         )
         btn_refresh_weights.click(
             refresh_weight_dropdowns,
@@ -6206,6 +7081,7 @@ def create_ui(config: AppConfig):
             generate_tts,
             inputs=[
                 job_state,
+                tts_mode,
                 model,
                 source_text,
                 gpt_weights,
@@ -6222,6 +7098,8 @@ def create_ui(config: AppConfig):
                 top_k,
                 top_p,
                 temperature,
+                auto_retries,
+                auto_pad_ms,
             ],
             outputs=[generated_audio, audio_state, status],
         )
@@ -6237,7 +7115,7 @@ def create_ui(config: AppConfig):
         )
         btn_crop.click(
             make_crop,
-            inputs=[job_state, image_state, crop_x, crop_y],
+            inputs=[job_state, image_file, crop_x, crop_y],
             outputs=[crop_preview, status],
         )
         btn_asr.click(
@@ -6306,8 +7184,27 @@ def create_ui(config: AppConfig):
         )
         btn_render.click(
             render_video,
-            inputs=[job_state, image_state, audio_state, bgm_file, source_text, srt_editor, crop_x, crop_y, bgm_volume, bgm_start],
+            inputs=[job_state, image_file, audio_state, bgm_file, source_text, srt_editor, crop_x, crop_y, bgm_volume, bgm_start],
             outputs=[video_preview, video_state, rendered_video_path, status],
+        )
+        btn_storyboard_export.click(
+            export_storyboard_package,
+            inputs=[
+                job_state,
+                image_file,
+                audio_state,
+                storyboard_images,
+                storyboard_json_file,
+                segment_id_map_file,
+                storyboard_mapping,
+                storyboard_subtitle_mode,
+                storyboard_fit,
+                storyboard_render_preview,
+                crop_x,
+                crop_y,
+            ],
+            outputs=[video_preview, status, storyboard_package_dir],
+            api_name="export_storyboard_package",
         )
         demo.load(
             note_browser_heartbeat,

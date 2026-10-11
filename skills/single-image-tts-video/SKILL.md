@@ -1,6 +1,6 @@
 ﻿---
 name: single-image-tts-video
-description: Create a subtitled 9:16 MP4 video from one still image and a GPT-SoVITS narration WAV, using the established Mutsumi reference video style. Use when the user provides or plans to provide an image for a single-frame vertical video, wants the local video WebUI, wants a 9:16 crop preview before production, wants the video duration to match narration audio, needs SRT subtitles generated or corrected, wants subtitle/audio QA, wants segmented TTS repair or manual missing-line patching inside the WebUI, wants to migrate the video-webui project, or wants Premiere/PR auxiliary files saved with the exported preview MP4.
+description: Create a subtitled 9:16 MP4 video from one still image and a GPT-SoVITS narration WAV, or build an offline storyboard package from numbered TTS timing and multiple images, using the established Mutsumi reference video style. Use when the user provides or plans to provide an image for a single-frame vertical video, wants the local video WebUI, wants a 9:16 crop preview before production, wants the video duration to match narration audio, needs SRT subtitles generated or corrected, wants subtitle/audio QA, wants Hybrid/Stable/Quick TTS modes or manual missing-line patching inside the WebUI, wants storyboard image timing by numbered segments, wants to migrate the video-webui project, or wants Premiere/PR auxiliary files saved with the exported preview MP4.
 ---
 
 # Single Image TTS Video
@@ -15,6 +15,8 @@ If the user mentions the local WebUI, `video-webui`, automatic missing-sentence 
 - One final reviewed narration WAV, usually from `outputs/tts_final`.
 - The original narration text file when available, so subtitle and audio coverage can be checked.
 - Optional BGM/music file from the user.
+- Optional multiple storyboard images plus a storyboard mapping, such as image 1 for `1.1,1.2`, image 2 for `2.1,2.2`, and image 3 for `2.3`.
+- Optional segment id map when the visible repair/listing numbers differ from the internal numbered timeline rows.
 
 ## Workflow
 
@@ -57,6 +59,19 @@ When the user sends a music file while making a video, use it as background musi
 - If speech feels masked, lower `--bgm-volume` before changing narration loudness.
 - If the user only asks to make the video and supplies music, include BGM automatically at conservative volume.
 
+## Storyboard Package Rules
+
+Use the storyboard package path when the user wants multiple images to switch on the same numbered TTS timeline, or wants to finish detailed cutting in Premiere, Jianying/CapCut, or another mature editor.
+
+- Keep the normal six-step WebUI video flow intact; storyboard export is an auxiliary handoff, not a replacement for TTS repair.
+- Base timing on WebUI TTS mode outputs, manual patch indexes, and the reviewed final narration audio, not on guessed image durations.
+- Subtitles are optional. Use `--subtitle-mode off` by default when images may already contain text.
+- Use `sidecar` when the user wants an SRT file, and `burn` only when they ask for a rendered local preview with burned subtitles.
+- A storyboard mapping can be uploaded as JSON or entered quickly in the WebUI as `image_number: segment_ids`.
+- Segment ids may be simple internal row ids (`1`, `2`, `3`) or user-facing ids (`1.1`, `1.2`) when a `segment-id-map` file is supplied.
+- Preserve exact timing artifacts: `timeline.json`, `segments.csv`, `shots.csv`, and `markers.csv` are the handoff source of truth for external editors.
+- Render preview MP4s with `libx264`; do not silently fall back to `mpeg4/mp4v`.
+
 ## Default Render Choices
 
 - Resolution: `1080x1920`
@@ -68,12 +83,13 @@ When the user sends a music file while making a video, use it as background musi
 - Video codec: require H.264 through `libx264` for final MP4 renders. Do not silently fall back to `mpeg4/mp4v` or hardware H.264 for still-image videos; those paths can introduce periodic flicker that survives later editing.
 - Subtitle style: bold white Chinese subtitles with black outline, centered near the lower safe area, matching `mutsmi_4.mp4`.
 - Subtitle text: no punctuation by default; wrap long entries with `--subtitle-max-chars 14` unless the user asks for a different density.
+- WebUI SRT editor text is authoritative for final render pages and manual line breaks. Keep each subtitle page to one or two lines; split longer editor blocks into consecutive pages before burning.
 - Subtitle safe area: keep horizontal and bottom margins so burned subtitles do not touch the frame edge.
 - Temporary copied source image, narration audio, BGM, and SRT sidecar are deleted by default after a burned-subtitle MP4 is exported. Pass `--keep-work-assets` only when those files are needed for manual editing.
 - ffmpeg path: configured in `config.json`, or pass `--ffmpeg`. Prefer a full system ffmpeg build with `libx264`; the bundled GPT-SoVITS ffmpeg may not include it.
 - ffprobe path: configured in `config.json`, or pass `--ffprobe`.
 - After each final render, inspect the top static region for repeated brightness jumps. If `flicker_check.json` reports `REVIEW`, do not continue editing that MP4 until the preview has been checked or re-rendered.
-- Manual sentence patch preview must stay isolated from the main narration audio. Only applying a candidate may update the main narration player/state, and the apply step must validate that the rebuilt audio is not abnormally short.
+- Manual sentence patch preview must stay isolated from the main narration audio. Only applying a candidate may update the main narration player/state. Replacement applies to the numbered target slot in the current full audio, preserving untouched prefix/suffix audio, and must validate that the resulting audio is not abnormally short or inconsistent with the replacement duration.
 
 If the user requests a horizontal or square video, change `--resolution`.
 
@@ -144,6 +160,47 @@ Create horizontal output:
   --resolution 1920x1080
 ```
 
+Export a storyboard handoff package from a WebUI job:
+
+```powershell
+& "<GPT-SoVITS-root>\runtime\python.exe" `
+  .\skills\single-image-tts-video\scripts\build_storyboard_package.py `
+  --webui-job .\video-webui\jobs\20260704_example `
+  --storyboard .\work\storyboard.json `
+  --subtitle-mode off `
+  --output-dir .\outputs\storyboard `
+  --name example_storyboard `
+  --ffmpeg "<ffmpeg.exe>" `
+  --ffprobe "<ffprobe.exe>"
+```
+
+Minimal storyboard JSON:
+
+```json
+{
+  "shots": [
+    {"image": "E:/TTS/assets/storyboard/image_001.png", "segments": ["1.1", "1.2"]},
+    {"image": "E:/TTS/assets/storyboard/image_002.png", "segments": ["2.1", "2.2"]},
+    {"image": "E:/TTS/assets/storyboard/image_003.png", "segments": ["2.3"]}
+  ]
+}
+```
+
+Render a local storyboard preview only after timing assets are ready:
+
+```powershell
+& "<GPT-SoVITS-root>\runtime\python.exe" `
+  .\skills\single-image-tts-video\scripts\build_storyboard_package.py `
+  --webui-job .\video-webui\jobs\20260704_example `
+  --storyboard .\work\storyboard.json `
+  --subtitle-mode sidecar `
+  --render-preview `
+  --output-dir .\outputs\storyboard `
+  --name example_preview `
+  --ffmpeg "<ffmpeg.exe>" `
+  --ffprobe "<ffprobe.exe>"
+```
+
 ## QA Rules
 
 - Do not export the final MP4 if the TTS checker reports missing chunks, boundary omissions, or repeated chunks.
@@ -151,7 +208,7 @@ Create horizontal output:
 - Do not rely on ASR text blindly; use the user's source text as the subtitle truth when audio is complete.
 - Keep the SRT readable: short subtitle lines are better than long wall-text lines.
 - Do not include punctuation in rendered subtitles unless the user explicitly asks for punctuation.
-- Break long subtitle text into multiple lines before burning subtitles, prefer punctuation or speech-pause boundaries, and check that lines stay within the 9:16 safe area.
+- Break long subtitle text into one or two display lines per subtitle page before burning subtitles. If it still does not fit, split it into another subtitle page instead of letting ffmpeg/libass auto-wrap it.
 - When BGM is present, inspect the mix. Narration must remain clearly intelligible; lower BGM if it masks speech.
 - If ffmpeg cannot burn subtitles, keep the sidecar SRT and report that subtitles were not burned in.
 - If a real `.prproj` is required, use Premiere through desktop automation; otherwise the `premiere_aux` folder is the default PR-ready handoff.

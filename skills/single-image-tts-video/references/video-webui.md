@@ -29,6 +29,7 @@ The WebUI calls scripts from this repository, including:
 - `skills/gptsovits-tts/scripts/gsv_tts.py`
 - `skills/gptsovits-tts/scripts/check_tts_match.py`
 - `skills/single-image-tts-video/scripts/make_single_image_video.py`
+- `skills/single-image-tts-video/scripts/build_storyboard_package.py`
 
 It also depends on:
 
@@ -63,50 +64,70 @@ Close the browser page to let the WebUI process exit automatically after its hea
 - Select reference audio/text preset, upload reference audio override, edit reference text.
 - Select prompt language and generated audio language.
 - Tune speed, fragment interval, `top_k`, `top_p`, and `temperature`.
-- Generate normal GPT-SoVITS TTS.
-- Generate segmented TTS auto-repair audio.
+- Generate GPT-SoVITS TTS with a top-right mode selector:
+  - `Hybrid` is the default: generate by sentence, then split only suspicious omissions into comma-level clauses.
+  - `Stable` generates comma-level clauses directly.
+  - `Quick` keeps the old whole-script generation path.
 - Generate crop preview and final single-image video.
 - Generate Faster-Whisper subtitles.
 - Edit SRT manually in the UI.
 - Retiming from the SRT editor is supported.
 - Local second review compares script, raw ASR, and final subtitles.
 - Optional Chat-compatible API review is present, but default `agent_review.mode` is `local`.
-- Automatic missing-sentence repair is present.
-- Manual patch target selection is present.
-- Single-sentence patch preview/apply is present in the SRT review area.
+- Manual patch indexing is present as step `3. 建立修补分段索引`.
+- Manual patch target selection and single-sentence preview/apply are present in the SRT review area.
+- Storyboard package export is present as a folded auxiliary section. It binds uploaded images to numbered segment ids, keeps subtitles optional, and writes editor handoff files without replacing the main six-step render flow.
 
 ## Recommended Main WebUI Workflow
 
 For long scripts:
 
 1. Prepare job.
-2. Run segmented TTS auto-repair.
-3. Run audio/subtitle review.
-4. Run automatic missing-sentence patch if needed.
-5. Use manual patch targets when needed.
-6. For fine tone fixes, generate a single-sentence preview and only apply it after human listening approves it.
-7. Render video.
+2. Keep the top-right TTS mode on `Hybrid` unless there is a specific reason to use `Stable` or `Quick`.
+3. Generate TTS.
+4. If the narration needs repair, run `3. 建立修补分段索引`, listen manually, then use numbered patch targets such as `1.1` or `2.3`.
+5. For fine tone fixes, generate a single-sentence preview and only apply it after human listening approves it.
+6. Generate/retime/review subtitles only when subtitles are needed.
+7. Export a storyboard package if multiple images need to follow the numbered audio timeline.
+8. Render video.
 
-Faster-Whisper subtitle generation is a diagnostic/manual tool, not the main path when using segmented TTS -> review -> patch.
+Faster-Whisper subtitle generation is a timing/review tool. Final subtitle text must come from the source script or SRT editor, not raw ASR wording.
 
-## TTS Repair Behavior
+## Storyboard Export
 
-Segmented repair:
+Use the folded `Storyboard / 分镜素材包导出` section after TTS timing or a manual patch index exists.
 
-- Splits long text into smaller chunks.
-- Generates each chunk independently with GPT-SoVITS.
-- Checks each generated chunk using Faster-Whisper.
-- Retries failed chunks.
-- Gives early chunks extra attempts because GPT-SoVITS often clips beginnings.
-- If a full chunk still fails, falls back to 10-20 character micro chunks.
-- Rebuilds final narration from accepted segment audio files.
+- Upload multiple images, optionally upload a storyboard JSON, or use the quick mapping textbox.
+- Quick mapping format is `image_number: segment_ids`, for example `1: 1.1,1.2`.
+- Upload a segment id map when visible repair ids such as `1.1` or `2.3` need to map onto internal segment rows.
+- Subtitle mode defaults to `off`; use `sidecar` for an SRT handoff or `burn` only when rendering a local preview.
+- The package is written under the current job as `storyboard/package/`.
+- Important outputs are `timeline.json`, `segments.csv`, `shots.csv`, `markers.csv`, copied image/audio assets, and optional `preview.mp4`.
+- The preview renderer must use `libx264`; do not use silent `mpeg4/mp4v` fallback.
 
-Secondary patch:
+## TTS Generation And Repair Behavior
 
-- Uses raw ASR if available to identify missing or weak chunks.
-- Does not append missing audio to the end.
-- Requires a complete segment audio map from segmented TTS.
-- For problematic chunks, splits into comma-level clauses, generates clauses, rebuilds the chunk, and replaces the original chunk position.
+Mode selector:
+
+- The TTS mode dropdown lives in the page header, not inside the detailed inference parameters.
+- `Hybrid` is default. It generates sentence-level audio first. If ASR looks more than 2 normalized characters shorter than the target sentence, only that sentence is rebuilt from comma-level clauses.
+- `Stable` generates comma-level clauses directly and checks each one for likely omission.
+- `Quick` generates the whole script once and leaves checking/repair to the manual workflow.
+- Stable and Hybrid write `logs/tts_progress.json` so long runs have a visible heartbeat/progress artifact.
+
+ASR self-check:
+
+- ASR is only a likely-omission signal for Stable/Hybrid generation.
+- Retry only when normalized ASR text is more than 2 characters shorter than the source segment.
+- Do not use keyword mismatch or CER as the main automatic retry criterion for Stable/Hybrid.
+- CER may still be useful for old reports or manual patch candidate diagnostics, but it should not make acceptable human-audible TTS churn forever.
+
+Manual patch index:
+
+- `3. 建立修补分段索引` is not an automatic repair button. It builds a numbered audio timeline from the current narration.
+- The user chooses targets by number after listening, then generates a preview and manually applies replacement/insert audio.
+- The current audio may change only after the user applies an approved candidate.
+- The patch sequence should preserve original narration order and avoid appending repaired audio to the end.
 
 Manual patch targets:
 
@@ -119,18 +140,18 @@ Manual patch targets:
 Single-sentence patch:
 
 - Located under `SRT 校对与任务目录` -> `单句补漏 / 替换试听`.
-- `6a. 生成单句试听` generates only the target sentence with independent speed, fragment interval, `top_k`, `top_p`, and `temperature`.
-- `6b. 应用到当前音频` inserts the sentence when raw ASR indicates it is missing; otherwise it replaces/rebuilds the targeted sentence audio.
+- `生成单句试听` generates only the target sentence with independent speed, fragment interval, `top_k`, `top_p`, and `temperature`.
+- `应用到当前音频` applies the approved candidate as an insert or replacement at the selected target.
 - Replacement is not additive: it removes the original target segment from the current audio sequence and then inserts the approved regenerated audio at that same position.
 - If a target number is supplied with rewritten/retouched text, treat it as replacement even if the new text is absent from raw ASR.
-- The user may repeatedly run `6a` with different single-sentence parameters and only run `6b` after the preview sounds right.
-- Raw ASR is preferred for deciding missing vs replacement because final script-aligned subtitles may already contain text that the audio omitted.
-- A complete segment audio map from `2b. 分段 TTS 自动修复` is still required so replacement can preserve the original narration order.
+- The user may repeatedly generate previews with different single-sentence parameters and only apply after the preview sounds right.
+- Raw ASR can help decide missing vs replacement, but the user's selected numbered target is authoritative.
+- A current patch sequence from Stable/Hybrid generation or `3. 建立修补分段索引` is required so replacement can preserve the original narration order.
 
 Manual patch cut accuracy:
 
 - Manual patch indexing first estimates clause times from Faster-Whisper word timestamps, then snaps every adjacent clause boundary to the quietest nearby audio valley.
-- Direct replacement uses sample-accurate `atrim` cuts, guarded neighbor search windows, and a short crossfade. It writes the real cut range to `logs/sentence_patch_direct_splice/splice_boundaries.json`.
+- Direct replacement uses the previous/next indexed unit boundaries to define the target slot, then performs sample-accurate `atrim` cuts and concatenates without crossfade or padding to preserve neighboring onsets and timing. The first slot starts at zero to remove any unindexed lead-in. It writes the real cut range to `logs/sentence_patch_direct_splice/splice_boundaries.json`.
 - If the bad audio crosses a boundary, select the continuous range together, for example `3.2,4.1`; this gives the cutter permission to replace the whole damaged span instead of guessing across a protected neighbor.
 
 ## Subtitle Rules
@@ -149,14 +170,14 @@ Manual patch cut accuracy:
 - A manual line break inside a page is treated as a final subtitle display line.
 - A blank line creates a new subtitle page when running `4b. 按编辑器重排时间轴`.
 - After `4b`, the editor is rewritten as SRT blocks whose text lines match final display wrapping.
-- Rendering uses the SRT editor pages and line breaks as the final subtitle pages and line breaks; do not rewrap them during final render.
+- Rendering uses the SRT editor pages and line breaks as the final subtitle pages and line breaks. If an editor block exceeds two safe lines, split it into consecutive subtitle pages before burning instead of allowing ffmpeg/libass to auto-wrap.
 
 Subtitle/audio isolation:
 
-- Audio repair may retime subtitles against the repaired audio, but it must preserve the current SRT editor page grouping and line breaks when the editor text still matches the source script.
+- Audio repair may retime subtitles against the repaired audio, but it must preserve the current SRT editor page grouping and line breaks whenever the editor contains subtitle text.
 - Existing SRT files passed to the render script preserve their line layout by default; use `--rewrite-srt-layout` only when explicitly rewrapping a raw external SRT.
 - Single-sentence patch preview is isolated from the main narration audio. Generating a candidate only updates the small patch preview/player and candidate state; the main narration player/state changes only after applying the candidate.
-- Applying a sentence patch should rebuild from the current patch index and validate the result before updating the main audio. Do not directly splice current audio by ASR time boundaries during manual repairs, because a boundary miss can cut neighboring clauses.
+- Applying a sentence patch should use the current patch index to locate the selected numbered slot, then replace that slot in the current full audio while preserving untouched prefix/suffix audio. Do not rebuild the whole file from pre-cut ASR chunks, and do not free-cut by the raw target ASR span alone; both paths can cut unrelated clauses when ASR boundaries are wrong.
 
 Codec rules:
 

@@ -16,6 +16,7 @@ work/
 outputs/
 logs/
 __pycache__/
+.codegraph/
 *.py[cod]
 
 # Local/private reference material

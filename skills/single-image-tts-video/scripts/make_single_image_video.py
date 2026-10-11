@@ -702,10 +702,11 @@ def render_video(
             "BorderStyle=1,"
             "Outline=1,"
             "Shadow=0,"
+            "WrapStyle=2,"
             "Alignment=2,"
             "MarginL=100,"
             "MarginR=100,"
-            "MarginV=80"
+            "MarginV=36"
         )
         vf_parts.append(f"subtitles=subtitles.srt:force_style='{style}'")
     video_filter = ",".join(vf_parts)
